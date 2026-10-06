@@ -213,27 +213,25 @@ This will sequentially execute agents defined in the workflow, enabling structur
 
 Here is a side-by-side comparison:
 
-| Dimension       │ Workflow Pipeline (`/workflow`)                                                   │ Child Subagent Tool (`subagent`) |
-| ─────────────────┼─────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────── |
-| Structure       │ Fixed / Deterministic: Defined beforehand (e.g. `["planner", "worker"]` in        │ Flexible / Dynamic: Decided on-the-fly by the main agent depending on what is needed. |
-|                 │ workflow.json).                                                                 │                                  |
-| Execution       │ Strictly Sequential: Step 1 must finish before Step 2 starts.                   │ Can run in Parallel: Multiple subagents can run concurrently if tasks are independent. |
-| Context Passing │ Chained Handoff: Output of Agent A is piped directly into the prompt of Agent   │ Hub-and-Spoke: Results go back to the Main Agent, which synthesizes and decides what to do |
-|                 │ B.                                                                              │ next.                            |
-| Control         │ Controlled by the pipeline script (fixed order).                                │ Controlled by the Main Agent LLM (autonomous judgment). |
+| Dimension | Workflow Pipeline (`/workflow`) | Child Subagent Tool (`subagent`) |
+|-----------|----------------------------------|----------------------------------|
+| **Structure** | Fixed / Deterministic: Defined beforehand (e.g. `["planner", "worker"]` in `workflow.json`). | Flexible / Dynamic: Decided on-the-fly by the main agent based on needs. |
+| **Execution** | Strictly Sequential: Step 1 must finish before Step 2 starts. | Can run in Parallel: Multiple subagents execute concurrently when tasks are independent. |
+| **Context Passing** | Chained Handoff: Output of Agent A is piped directly into the prompt of Agent B. | Hub-and-Spoke: Results flow back to the Main Agent, which synthesizes and decides next steps. |
+| **Control** | Controlled by the pipeline script (fixed order). | Controlled by the Main Agent LLM (autonomous judgment). |
 
 ### When to use which?
 
 #### Use Workflow Pipeline when:
 
 • You have a standard, repeatable assembly line where the order never changes:
-    • Example: Scout (find code) → Planner (create plan) → Worker (implement) → Reviewer (check code).
+    • Example: `Scout → Planner → Worker → Reviewer`.
 • Each step strictly depends on the output of the previous step.
 
 #### Use Child Subagents when:
 
 • You need speed & concurrency:
-    • Example: "Inspect the auth module AND inspect the database schema at the same time." (Spawns 2 subagents simultaneously).
+    • Example: "Inspect the auth module AND inspect the database schema at the same time." (spawns 2 subagents simultaneously).
 • The task is unpredictable:
     • The main agent doesn't know in advance how many sub-tasks will be needed until it starts exploring.
 
