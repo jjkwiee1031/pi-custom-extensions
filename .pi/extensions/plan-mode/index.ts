@@ -161,7 +161,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let executionMode = false;
 	let todoItems: TodoItem[] = [];
 	let toolsBeforePlanMode: string[] | undefined;
-	let planSetInThisTurn = false;
+	let planPromptedInThisTurn = false;
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only exploration and planning)",
@@ -390,6 +390,58 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		handler: async (ctx) => togglePlanMode(ctx),
 	});
 
+	async function promptUserForPlan(
+		ctx: ExtensionContext,
+	): Promise<"execute" | "stay" | { refine: string }> {
+		if (todoItems.length === 0) return "stay";
+
+		// 1. Immediately send the plan message to the chat transcript before asking for choice
+		const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
+		const planTodoListMessage = {
+			customType: "plan-todo-list",
+			content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+			display: true,
+		};
+		pi.sendMessage(planTodoListMessage);
+
+		// 2. Update widget so the checklist is immediately visible above the editor
+		const widgetLines = todoItems.map((item) => `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`);
+		ctx.ui.setWidget("plan-todos", widgetLines);
+
+		// 3. Display the plan steps directly inside the selection prompt so the user sees it while choosing
+		const planSummary = todoItems.map((t) => `  ${t.step}. ${t.text}`).join("\n");
+		const selectPrompt = `📋 Plan Ready (${todoItems.length} steps):\n\n${planSummary}\n\nWhat would you like to do?`;
+
+		const choice = await ctx.ui.select(selectPrompt, [
+			"Execute the plan (track progress)",
+			"Stay in plan mode",
+			"Refine the plan",
+		]);
+
+		if (choice?.startsWith("Execute")) {
+			const firstTodoItem = todoItems[0];
+			if (firstTodoItem) {
+				firstTodoItem.status = "in_progress";
+			}
+			planModeEnabled = false;
+			executionMode = true;
+			restoreNormalModeTools();
+			updateStatus(ctx);
+			persistState();
+			return "execute";
+		}
+
+		if (choice === "Refine the plan") {
+			const refinement = await ctx.ui.editor("Refine the plan:", "");
+			return { refine: refinement?.trim() || "" };
+		}
+
+		// User chose "Stay in plan mode" or dismissed (Esc)
+		ctx.ui.notify("Staying in plan mode. You can continue discussing or refining the plan.", "info");
+		updateStatus(ctx);
+		return "stay";
+	}
+
 	// Register the `todo` tool for the LLM — the ONLY way the agent modifies todos
 	pi.registerTool({
 		name: "todo",
@@ -397,6 +449,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		description:
 			"Manage and track the plan execution todo list. Actions: list (view todos), add (add step), start (mark step in-progress by id), done (mark step completed by id), toggle (toggle step completion by id), set (set initial list of todos), clear (clear todos). Calling this tool is REQUIRED to update plan progress.",
 		parameters: TodoParamsSchema,
+		executionMode: "sequential",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			switch (params.action) {
@@ -445,15 +498,53 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 						status: "pending",
 						completed: false,
 					}));
-					planSetInThisTurn = true;
+					planPromptedInThisTurn = true;
 					updateStatus(ctx);
 					persistState();
+
+					if (ctx.hasUI) {
+						// Interactively pause the agent run and wait for user approval right now!
+						const decision = await promptUserForPlan(ctx);
+
+						if (decision === "execute") {
+							const first = todoItems[0];
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Plan approved by user! You are now in EXECUTION MODE with full tool access unlocked (edit, write, bash enabled).\n\nActive step: Step #1: "${first?.text}".\nNext tools to call: Use read, edit, write, or bash to implement Step 1. When finished, call todo(action: 'done', id: 1).`,
+									},
+								],
+							};
+						}
+
+						if (typeof decision === "object" && "refine" in decision) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: `User reviewed the plan and requested refinements:\n"${decision.refine}"\n\nPlease address the user's feedback, adjust your plan, and call todo(action: "set", todos: [...]) with the updated plan. Do not execute code changes yet.`,
+									},
+								],
+							};
+						}
+
+						// decision === "stay"
+						return {
+							content: [
+								{
+									type: "text",
+									text: "User reviewed the plan and chose to stay in plan mode without executing yet. Do not make code changes. Wait for user instructions or answer any user questions in chat.",
+								},
+							],
+						};
+					}
 
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Initialized ${todoItems.length} plan steps for execution tracking. Present your plan clearly to the user under a "Plan:" header.`,
+								text: `Initialized ${todoItems.length} plan steps for execution tracking. Waiting for user approval.`,
 							},
 						],
 					};
@@ -473,9 +564,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 						completed: false,
 					};
 					todoItems.push(newItem);
-					if (planModeEnabled) {
-						planSetInThisTurn = true;
-					}
 					updateStatus(ctx);
 					persistState();
 
@@ -490,6 +578,17 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				}
 
 				case "start": {
+					if (planModeEnabled) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: "Error: Cannot start execution steps while still in plan mode. The plan must first be initialized with todo(action: 'set', todos: [...]) and approved by the user.",
+								},
+							],
+						};
+					}
+
 					if (params.id === undefined) {
 						return {
 							content: [{ type: "text", text: "Error: id is required for action 'start'." }],
@@ -780,6 +879,12 @@ IMPORTANT: You MUST call the \`todo\` tool to update progress and modify the che
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
 		if (!lastAssistant) return;
 
+		// If the user was already prompted during todo(action: "set") in this turn, skip
+		if (planPromptedInThisTurn) {
+			planPromptedInThisTurn = false;
+			return;
+		}
+
 		// 1. If the assistant called a question tool, it is actively asking questions: do not prompt
 		if (hasQuestionToolCall(lastAssistant)) return;
 
@@ -788,7 +893,8 @@ IMPORTANT: You MUST call the \`todo\` tool to update progress and modify the che
 		// 2. If the assistant text is asking a question or requesting clarification: do not prompt
 		if (isAskingQuestion(assistantText)) return;
 
-		// 3. Check if a plan was output in text, or previously initialized via the todo tool in this turn
+		// 3. Check if a plan was output in text
+		let planSetInThisTurn = false;
 		const extracted = extractTodoItems(assistantText);
 		if (extracted.length > 0) {
 			todoItems = extracted;
@@ -799,45 +905,11 @@ IMPORTANT: You MUST call the \`todo\` tool to update progress and modify the che
 		if (!planSetInThisTurn || todoItems.length === 0) {
 			return;
 		}
-		planSetInThisTurn = false;
 		persistState();
 
-		// Show plan steps and prompt user for next step
-		const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
-		const planTodoListMessage = {
-			customType: "plan-todo-list",
-			content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-			display: true,
-		};
-
-		// 1. Immediately send the plan message to the chat transcript before asking for choice
-		pi.sendMessage(planTodoListMessage);
-
-		// 2. Update widget so the checklist is immediately visible above the editor
-		const widgetLines = todoItems.map((item) => `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`);
-		ctx.ui.setWidget("plan-todos", widgetLines);
-
-		// 3. Display the plan steps directly inside the selection prompt so the user sees it while choosing
-		const planSummary = todoItems.map((t) => `  ${t.step}. ${t.text}`).join("\n");
-		const selectPrompt = `📋 Plan Ready (${todoItems.length} steps):\n\n${planSummary}\n\nWhat would you like to do?`;
-
-		const choice = await ctx.ui.select(selectPrompt, [
-			"Execute the plan (track progress)",
-			"Stay in plan mode",
-			"Refine the plan",
-		]);
-
-		if (choice?.startsWith("Execute")) {
+		const decision = await promptUserForPlan(ctx);
+		if (decision === "execute") {
 			const firstTodoItem = todoItems[0];
-			if (!firstTodoItem) return;
-
-			planModeEnabled = false;
-			executionMode = true;
-			firstTodoItem.status = "in_progress";
-			restoreNormalModeTools();
-			updateStatus(ctx);
-			persistState();
-
 			const remainingList = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
 			const execMessage = `Execute the plan.
 
@@ -845,7 +917,7 @@ Plan Todos:
 ${remainingList}
 
 Next tools to call:
-1. Step 1 is now active: "${firstTodoItem.text}".
+1. Step 1 is now active: "${firstTodoItem?.text}".
 2. Call \`read\`, \`edit\`, \`write\`, or \`bash\` to implement Step 1.
 3. Call \`todo(action: "done", id: 1)\` once Step 1 is verified and complete.
 4. Next, call \`todo(action: "start", id: 2)\` for the next step.
@@ -856,15 +928,10 @@ Remember: Call the \`todo\` tool to update progress as you complete each step.`;
 				{ customType: "plan-mode-execute", content: execMessage, display: true },
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
-		} else if (choice === "Refine the plan") {
-			const refinement = await ctx.ui.editor("Refine the plan:", "");
-			if (refinement?.trim()) {
-				pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
+		} else if (typeof decision === "object" && "refine" in decision) {
+			if (decision.refine.trim()) {
+				pi.sendUserMessage(decision.refine.trim(), { deliverAs: "followUp" });
 			}
-		} else {
-			// User chose "Stay in plan mode" or dismissed (Esc)
-			ctx.ui.notify("Staying in plan mode. You can continue discussing or refining the plan.", "info");
-			updateStatus(ctx);
 		}
 	});
 

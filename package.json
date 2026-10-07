@@ -1,0 +1,31 @@
+{
+  "name": "newpi",
+  "version": "1.0.0",
+  "description": "A comprehensive agent framework with plan-mode exploration and subagent delegation capabilities.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jjkwiee1031/pi-plan-subagent-extension.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jjkwiee1031/pi-plan-subagent-extension/issues"
+  },
+  "homepage": "https://github.com/jjkwiee1031/pi-plan-subagent-extension#readme",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "pino": "^10.4.0",
+    "qrcode-terminal": "^0.12.0",
+    "typebox": "^1.3.36"
+  },
+  "devDependencies": {
+    "@types/pino": "^7.0.4",
+    "@types/qrcode-terminal": "^0.12.2"
+  }
+}
