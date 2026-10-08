@@ -1,27 +1,384 @@
 /**
- * WhatsApp Pi Extension
+ * WhatsApp Extension for Pi Agent
  *
- * Connects WhatsApp with Pi Agent using WhiskeySockets/Baileys.
- * Provides tools for the LLM to send and read messages, slash commands to
- * manage connections and QR pairing, real-time status indicators in the footer,
- * and optional auto-relay of incoming WhatsApp messages into the Pi Agent context.
+ * Connects WhatsApp to Pi using Baileys. Enables the agent to send messages and media,
+ * provides terminal QR code pairing, footer status indicators, and relays "Note to Self"
+ * incoming WhatsApp messages to trigger agent turns remotely.
  */
 
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
 import * as path from "node:path";
+import makeWASocket, {
+	DisconnectReason,
+	fetchLatestBaileysVersion,
+	generateMessageIDV2,
+	makeCacheableSignalKeyStore,
+	useMultiFileAuthState,
+	type proto,
+	type WASocket,
+} from "@whiskeysockets/baileys";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { WhatsAppClient } from "./client.ts";
-import { WhatsAppStatusComponent } from "./components.ts";
-import {
-	formatJid,
-	formatPhoneNumber,
-	WhatsAppReadParamsSchema,
-	WhatsAppSendParamsSchema,
-	WhatsAppStatusParamsSchema,
-	type WhatsAppReadParams,
-	type WhatsAppRelayMode,
-	type WhatsAppSendParams,
-} from "./utils.ts";
+import pino from "pino";
+import qrcode from "qrcode-terminal";
+import { Type, type Static } from "typebox";
+import { WhatsAppStatusComponent, type WhatsAppClientView } from "./components.ts";
 
+/**
+ * Filter out noisy libsignal terminal leaks (Opening session, pendingPreKey) that corrupt Pi's TUI.
+ */
+function installLibsignalNoiseFilter(): void {
+	const noisyPatterns = ["Opening session:", "Closing session:", "pendingPreKey", "Session already"];
+	const wrap = (origWrite: typeof process.stdout.write) => {
+		return function (chunk: any, ...args: any[]): boolean {
+			const str = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString() : "";
+			if (noisyPatterns.some((pattern) => str.includes(pattern))) {
+				return true;
+			}
+			return (origWrite as any)(chunk, ...args);
+		};
+	};
+	process.stdout.write = wrap(process.stdout.write.bind(process.stdout));
+	process.stderr.write = wrap(process.stderr.write.bind(process.stderr));
+}
+
+installLibsignalNoiseFilter();
+
+/**
+ * Normalizes phone number or raw target into a valid WhatsApp JID.
+ */
+export function formatJid(target: string): string {
+	const trimmed = target.trim();
+	if (trimmed.toLowerCase() === "me" || trimmed.toLowerCase() === "myself") {
+		return "me";
+	}
+	if (trimmed.includes("@")) {
+		return trimmed.endsWith("@c.us") ? trimmed.replace("@c.us", "@s.whatsapp.net") : trimmed;
+	}
+	const digits = trimmed.replace(/\D/g, "");
+	return digits ? `${digits}@s.whatsapp.net` : trimmed;
+}
+
+export type WhatsAppConnectionStatus = "disconnected" | "connecting" | "qr_ready" | "connected";
+export type WhatsAppRelayMode = "notify" | "auto" | "off";
+
+export interface IncomingSelfMessage {
+	id: string;
+	chatJid: string;
+	text: string;
+	isGroup: boolean;
+	timestamp: number;
+}
+
+/**
+ * Lightweight Baileys connection and socket manager.
+ */
+export class WhatsAppClient extends EventEmitter implements WhatsAppClientView {
+	private sock: WASocket | null = null;
+	private authDir: string;
+	private status: WhatsAppConnectionStatus = "disconnected";
+	private userJid: string | null = null;
+	private userName: string | null = null;
+	private currentQr: string | null = null;
+	private currentQrAscii: string | null = null;
+	private reconnectTimeout: NodeJS.Timeout | null = null;
+	private intentionalDisconnect = false;
+	private sentMessageIds = new Set<string>();
+	private messageStore = new Map<string, proto.IMessage>();
+
+	constructor(authDir: string) {
+		super();
+		this.authDir = authDir;
+		if (!fs.existsSync(this.authDir)) {
+			fs.mkdirSync(this.authDir, { recursive: true });
+		}
+	}
+
+	public getStatus() {
+		return {
+			status: this.status,
+			userJid: this.userJid,
+			userName: this.userName,
+			authDir: this.authDir,
+			currentQrAscii: this.currentQrAscii,
+		};
+	}
+
+	public isConnected(): boolean {
+		return this.status === "connected" && this.sock !== null;
+	}
+
+	public getQrCode() {
+		return { raw: this.currentQr, ascii: this.currentQrAscii };
+	}
+
+	public async connect(): Promise<void> {
+		if (this.status === "connected" || this.status === "connecting") return;
+
+		this.intentionalDisconnect = false;
+		this.setStatus("connecting");
+
+		try {
+			const logger = pino({ level: "silent" });
+			const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+			const { version } = await fetchLatestBaileysVersion();
+
+			this.sock = makeWASocket({
+				version,
+				logger,
+				auth: {
+					creds: state.creds,
+					keys: makeCacheableSignalKeyStore(state.keys, logger),
+				},
+				printQRInTerminal: false,
+				generateHighQualityLinkPreview: true,
+				syncFullHistory: false,
+				getMessage: async (key) => {
+					return key.id ? this.messageStore.get(key.id) : undefined;
+				},
+			});
+
+			this.sock.ev.on("creds.update", saveCreds);
+
+			this.sock.ev.on("connection.update", (update) => {
+				const { connection, lastDisconnect, qr } = update;
+
+				if (qr) {
+					this.currentQr = qr;
+					qrcode.generate(qr, { small: true }, (ascii) => {
+						this.currentQrAscii = ascii;
+						this.setStatus("qr_ready");
+						this.emit("qr", qr, ascii);
+					});
+				}
+
+				if (connection === "open") {
+					this.currentQr = null;
+					this.currentQrAscii = null;
+					this.userJid = this.sock?.user?.id ?? null;
+					this.userName = this.sock?.user?.name ?? null;
+					this.setStatus("connected");
+					this.emit("connected", { jid: this.userJid ?? "", name: this.userName ?? undefined });
+				} else if (connection === "close") {
+					const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+					const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+
+					this.userJid = null;
+					this.userName = null;
+					this.setStatus("disconnected");
+					this.emit("disconnected", { statusCode, isLoggedOut });
+
+					if (isLoggedOut) {
+						this.cleanAuthDir();
+					} else if (!this.intentionalDisconnect) {
+						this.scheduleReconnect();
+					}
+				}
+			});
+
+			this.sock.ev.on("messages.upsert", ({ messages }) => {
+				for (const raw of messages) {
+					this.handleIncomingMessage(raw);
+				}
+			});
+		} catch (err: any) {
+			this.setStatus("disconnected");
+			this.emit("error", err instanceof Error ? err : new Error(String(err)));
+			if (!this.intentionalDisconnect) {
+				this.scheduleReconnect();
+			}
+		}
+	}
+
+	private setStatus(newStatus: WhatsAppConnectionStatus): void {
+		this.status = newStatus;
+		this.emit("statusChange", newStatus);
+	}
+
+	private scheduleReconnect(): void {
+		if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+		this.reconnectTimeout = setTimeout(() => {
+			if (!this.intentionalDisconnect && this.status !== "connected") {
+				this.connect().catch(() => {});
+			}
+		}, 5000);
+	}
+
+	private handleIncomingMessage(raw: proto.IWebMessageInfo): void {
+		if (!raw.message || !raw.key) return;
+
+		const id = raw.key.id ?? "";
+		if (id && raw.message) {
+			this.messageStore.set(id, raw.message);
+			if (this.messageStore.size > 200) {
+				const oldest = this.messageStore.keys().next().value;
+				if (oldest) this.messageStore.delete(oldest);
+			}
+		}
+
+		// Strictly process messages sent by myself ("Note to Self")
+		if (!raw.key.fromMe) return;
+
+		// Ignore messages generated by this agent extension to avoid loops
+		if (this.sentMessageIds.has(id)) return;
+
+		const msg = raw.message;
+		let text = "";
+		if (msg.conversation) {
+			text = msg.conversation;
+		} else if (msg.extendedTextMessage?.text) {
+			text = msg.extendedTextMessage.text;
+		} else if (msg.imageMessage?.caption) {
+			text = msg.imageMessage.caption;
+		} else if (msg.videoMessage?.caption) {
+			text = msg.videoMessage.caption;
+		} else if (msg.documentMessage?.caption || msg.documentMessage?.fileName) {
+			text = msg.documentMessage.caption || `[Document: ${msg.documentMessage.fileName}]`;
+		}
+
+		const chatJid = raw.key.remoteJid ?? "";
+		const selfMessage: IncomingSelfMessage = {
+			id,
+			chatJid,
+			text: text.trim(),
+			isGroup: chatJid.endsWith("@g.us"),
+			timestamp: raw.messageTimestamp ? Number(raw.messageTimestamp) * 1000 : Date.now(),
+		};
+
+		this.emit("message", selfMessage);
+	}
+
+	public async sendTextMessage(to: string, text: string): Promise<{ success: boolean; id?: string; error?: string; toJid?: string }> {
+		if (!this.isConnected() || !this.sock) {
+			return { success: false, error: "WhatsApp is not connected. Run '/whatsapp connect' in the terminal first." };
+		}
+
+		try {
+			const jid = formatJid(to);
+			const messageId = generateMessageIDV2(this.sock.user?.id);
+			this.sentMessageIds.add(messageId);
+
+			const result = await this.sock.sendMessage(jid, { text }, { messageId });
+			if (result?.key?.id && result?.message) {
+				this.messageStore.set(result.key.id, result.message);
+			}
+
+			return { success: true, id: result?.key?.id ?? messageId, toJid: jid };
+		} catch (err: any) {
+			return { success: false, error: err?.message || String(err) };
+		}
+	}
+
+	public async sendMediaMessage(
+		to: string,
+		filePath: string,
+		caption?: string,
+	): Promise<{ success: boolean; id?: string; error?: string; toJid?: string }> {
+		if (!this.isConnected() || !this.sock) {
+			return { success: false, error: "WhatsApp is not connected. Run '/whatsapp connect' in the terminal first." };
+		}
+
+		const resolvedPath = path.resolve(filePath);
+		if (!fs.existsSync(resolvedPath)) {
+			return { success: false, error: `File not found at path: ${resolvedPath}` };
+		}
+
+		try {
+			const jid = formatJid(to);
+			const buffer = fs.readFileSync(resolvedPath);
+			const ext = path.extname(resolvedPath).toLowerCase();
+			const fileName = path.basename(resolvedPath);
+
+			let messageContent: any;
+			if ([".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(ext)) {
+				messageContent = { image: buffer, caption: caption ?? undefined };
+			} else if ([".mp4", ".mov", ".mkv", ".avi"].includes(ext)) {
+				messageContent = { video: buffer, caption: caption ?? undefined };
+			} else if ([".mp3", ".ogg", ".wav", ".m4a"].includes(ext)) {
+				messageContent = {
+					audio: buffer,
+					mimetype: ext === ".mp3" ? "audio/mpeg" : ext === ".ogg" ? "audio/ogg" : "audio/mp4",
+				};
+			} else {
+				messageContent = {
+					document: buffer,
+					mimetype: "application/octet-stream",
+					fileName,
+					caption: caption ?? undefined,
+				};
+			}
+
+			const messageId = generateMessageIDV2(this.sock.user?.id);
+			this.sentMessageIds.add(messageId);
+
+			const result = await this.sock.sendMessage(jid, messageContent, { messageId });
+			if (result?.key?.id && result?.message) {
+				this.messageStore.set(result.key.id, result.message);
+			}
+
+			return { success: true, id: result?.key?.id ?? messageId, toJid: jid };
+		} catch (err: any) {
+			return { success: false, error: err?.message || String(err) };
+		}
+	}
+
+	public async disconnect(): Promise<void> {
+		this.intentionalDisconnect = true;
+		if (this.reconnectTimeout) {
+			clearTimeout(this.reconnectTimeout);
+			this.reconnectTimeout = null;
+		}
+
+		if (this.sock) {
+			try {
+				this.sock.end(undefined);
+			} catch {}
+			this.sock = null;
+		}
+
+		this.setStatus("disconnected");
+	}
+
+	public async clearSession(): Promise<void> {
+		await this.disconnect();
+		this.cleanAuthDir();
+	}
+
+	private cleanAuthDir(): void {
+		if (fs.existsSync(this.authDir)) {
+			try {
+				fs.rmSync(this.authDir, { recursive: true, force: true });
+				fs.mkdirSync(this.authDir, { recursive: true });
+			} catch {}
+		}
+	}
+}
+
+// LLM Tool Schema
+export const WhatsAppSendParamsSchema = Type.Object({
+	to: Type.String({
+		description: "WhatsApp Chat JID or phone number (e.g. '1234567890@s.whatsapp.net', or incoming message chatJid)",
+	}),
+	message: Type.String({
+		description: "Text message content to send",
+	}),
+	mediaPath: Type.Optional(
+		Type.String({
+			description: "Optional local file path to an image, video, audio, or document to send as an attachment",
+		}),
+	),
+	caption: Type.Optional(
+		Type.String({
+			description: "Optional caption for the media attachment",
+		}),
+	),
+});
+
+export type WhatsAppSendParams = Static<typeof WhatsAppSendParamsSchema>;
+
+/**
+ * Main WhatsApp Extension Entry Point
+ */
 export default function whatsappExtension(pi: ExtensionAPI): void {
 	const authDir = path.join(process.cwd(), ".pi", "whatsapp_auth");
 	const client = new WhatsAppClient(authDir);
@@ -29,9 +386,8 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 	let currentContext: ExtensionContext | null = null;
 	let relayMode: WhatsAppRelayMode = "notify";
 	let lastQrShown: string | null = null;
-	const sentMessageIds = new Set<string>();
 
-	// Register flags
+	// CLI Flags
 	pi.registerFlag("whatsapp", {
 		description: "Connect to WhatsApp automatically on agent startup",
 		type: "boolean",
@@ -39,7 +395,7 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerFlag("whatsapp-relay", {
-		description: "Incoming WhatsApp message behavior: notify, auto, off",
+		description: "Incoming WhatsApp self-message relay behavior: notify, auto, off",
 		type: "string",
 		default: "notify",
 	});
@@ -47,7 +403,6 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 	function getSafeContext(): ExtensionContext | null {
 		if (!currentContext) return null;
 		try {
-			// Touch guarded property to verify context is not stale
 			void currentContext.cwd;
 			return currentContext;
 		} catch {
@@ -63,21 +418,12 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 		try {
 			const status = client.getStatus();
 			if (status.status === "connected") {
-				const label = status.userName || (status.userJid ? formatPhoneNumber(status.userJid) : "connected");
-				targetCtx.ui.setStatus(
-					"whatsapp",
-					targetCtx.ui.theme.fg("success", `[WA: ${label}]`),
-				);
+				const label = status.userName || (status.userJid ? status.userJid.split("@")[0] : "connected");
+				targetCtx.ui.setStatus("whatsapp", targetCtx.ui.theme.fg("success", `[WA: ${label}]`));
 			} else if (status.status === "connecting") {
-				targetCtx.ui.setStatus(
-					"whatsapp",
-					targetCtx.ui.theme.fg("warning", "[WA: connecting]"),
-				);
+				targetCtx.ui.setStatus("whatsapp", targetCtx.ui.theme.fg("warning", "[WA: connecting]"));
 			} else if (status.status === "qr_ready") {
-				targetCtx.ui.setStatus(
-					"whatsapp",
-					targetCtx.ui.theme.fg("warning", "[WA: scan QR]"),
-				);
+				targetCtx.ui.setStatus("whatsapp", targetCtx.ui.theme.fg("warning", "[WA: scan QR]"));
 			} else {
 				targetCtx.ui.setStatus("whatsapp", undefined);
 			}
@@ -103,23 +449,17 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 	): void {
 		try {
 			pi.sendMessage(message, options);
-		} catch {
-			// Ignored if session is reloading or replaced
-		}
+		} catch {}
 	}
 
 	// Client event listeners
-	client.on("statusChange", (_newStatus) => {
-		updateStatus();
-	});
+	client.on("statusChange", () => updateStatus());
 
-	client.on("qr", (qr, _ascii) => {
+	client.on("qr", (qr) => {
 		if (qr === lastQrShown) return;
 		lastQrShown = qr;
 		updateStatus();
-
 		safeNotify("WhatsApp QR code generated. Run '/whatsapp qr' to scan.", "warning");
-
 		safeSendMessage(
 			{
 				customType: "whatsapp-qr",
@@ -136,9 +476,7 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 	client.on("connected", ({ jid, name }) => {
 		lastQrShown = null;
 		updateStatus();
-
 		safeNotify(`WhatsApp connected as ${name || jid}!`, "info");
-
 		safeSendMessage(
 			{
 				customType: "whatsapp-status",
@@ -157,30 +495,22 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 		);
 	});
 
-	client.on("message", (msg) => {
-		// Only handle messages from myself
-		if (!msg.fromMe) return;
-
-		// Ignore messages generated by this agent/extension itself
-		if (sentMessageIds.has(msg.id)) return;
-
-		const targetChat = msg.chatJid;
-		const previewText = msg.text ? (msg.text.length > 60 ? `${msg.text.slice(0, 57)}...` : msg.text) : "[Media]";
+	client.on("message", (msg: IncomingSelfMessage) => {
+		const previewText = msg.text ? (msg.text.length > 60 ? `${msg.text.slice(0, 57)}...` : msg.text) : "[Media/Attachment]";
 
 		if (relayMode === "notify" || relayMode === "auto") {
-			safeNotify(`WA (from me) in ${targetChat}: ${previewText}`, "info");
+			safeNotify(`WA (Note to Self): ${previewText}`, "info");
 		}
 
-		if (relayMode === "auto") {
-			const chatType = msg.isGroup ? "Group Chat" : "Self / Direct Chat";
+		if (relayMode === "auto" && msg.text) {
+			const chatType = msg.isGroup ? "Group Chat" : "Self Chat";
 			safeSendMessage(
 				{
 					customType: "whatsapp-incoming",
 					content:
-						`📨 **WhatsApp Message from Yourself (${chatType}):**\n` +
-						`- **Chat:** \`${msg.chatJid}\`\n` +
-						`- **Type:** \`${msg.type}\`\n\n` +
-						`> ${msg.text || "[No text content]"}\n\n` +
+						`📨 **WhatsApp Note to Self (${chatType}):**\n` +
+						`- **Chat:** \`${msg.chatJid}\`\n\n` +
+						`> ${msg.text}\n\n` +
 						`*To respond back to this chat, call \`whatsapp_send(to: "${msg.chatJid}", message: "...")\`.*`,
 					display: true,
 				},
@@ -189,12 +519,12 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Register LLM Tool: whatsapp_send
+	// Register LLM Tool: whatsapp_send (single focused tool)
 	pi.registerTool({
 		name: "whatsapp_send",
 		label: "WhatsApp Send",
 		description:
-			"Send a WhatsApp message (text or media attachment) directly to a WhatsApp chat JID (e.g. from an incoming message's chatJid, a group JID, or a contact JID).",
+			"Send a WhatsApp message (text or media attachment) directly to a WhatsApp chat JID (e.g. from an incoming note's chatJid, a group JID, or a phone number).",
 		parameters: WhatsAppSendParamsSchema,
 		executionMode: "sequential",
 
@@ -217,13 +547,11 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 						content: [{ type: "text", text: `Failed to send WhatsApp media message: ${result.error}` }],
 					};
 				}
-				if (result.id) sentMessageIds.add(result.id);
-				const target = result.toJid ?? params.to;
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully sent media message to ${target}. Message ID: ${result.id}`,
+							text: `Successfully sent media message to ${result.toJid ?? params.to}. Message ID: ${result.id}`,
 						},
 					],
 				};
@@ -235,127 +563,21 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 					content: [{ type: "text", text: `Failed to send WhatsApp text message: ${result.error}` }],
 				};
 			}
-			if (result.id) sentMessageIds.add(result.id);
 
-			const target = result.toJid ?? params.to;
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Successfully sent WhatsApp message to ${target}. Message ID: ${result.id}`,
+						text: `Successfully sent WhatsApp message to ${result.toJid ?? params.to}. Message ID: ${result.id}`,
 					},
 				],
 			};
 		},
 	});
 
-	// Register LLM Tool: whatsapp_read
-	pi.registerTool({
-		name: "whatsapp_read",
-		label: "WhatsApp Read",
-		description:
-			"Read recent WhatsApp messages (incoming and outgoing), optionally filtered by contact phone number or group chat.",
-		parameters: WhatsAppReadParamsSchema,
-		executionMode: "sequential",
-
-		async execute(_toolCallId, params: WhatsAppReadParams) {
-			const messages = client.getRecentMessages({
-				chat: params.chat,
-				limit: params.limit ?? 10,
-				incomingOnly: params.incomingOnly,
-			});
-
-			if (messages.length === 0) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: params.chat
-								? `No recent WhatsApp messages found for chat "${params.chat}".`
-								: "No recent WhatsApp messages recorded in this session.",
-						},
-					],
-				};
-			}
-
-			const formatted = messages
-				.map((m) => {
-					const dir = m.fromMe ? "Outgoing (Me -> Contact)" : "Incoming";
-					const sender = m.senderName ? `${m.senderName} (${m.senderNumber})` : m.senderNumber;
-					const time = new Date(m.timestamp).toLocaleTimeString();
-					return `[${time}] ${dir} - ${sender} (${m.chatJid}):\n  ${m.text || `[${m.type}]`}`;
-				})
-				.join("\n\n");
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Recent WhatsApp Messages (${messages.length}):\n\n${formatted}`,
-					},
-				],
-			};
-		},
-	});
-
-	// Register LLM Tool: whatsapp_status
-	pi.registerTool({
-		name: "whatsapp_status",
-		label: "WhatsApp Status",
-		description: "Check the current WhatsApp connection status, logged-in user phone number, and message statistics.",
-		parameters: WhatsAppStatusParamsSchema,
-		executionMode: "sequential",
-
-		async execute() {
-			const status = client.getStatus();
-			const connected = client.isConnected();
-
-			return {
-				content: [
-					{
-						type: "text",
-						text:
-							`WhatsApp Status:\n` +
-							`- State: ${status.status}\n` +
-							`- Connected: ${connected ? "Yes" : "No"}\n` +
-							`- User: ${status.userName || "N/A"}\n` +
-							`- User JID: ${status.userJid || "N/A"}\n` +
-							`- Messages in session: ${status.messageCount}\n` +
-							`- Relay mode: ${relayMode}`,
-					},
-				],
-			};
-		},
-	});
-
-	// Register LLM Tool: whatsapp_clear
-	pi.registerTool({
-		name: "whatsapp_clear",
-		label: "WhatsApp Clear Session",
-		description:
-			"Clear the WhatsApp connection session, remove stored login credentials from disk, wipe session message history, and disconnect.",
-		parameters: WhatsAppStatusParamsSchema,
-		executionMode: "sequential",
-
-		async execute() {
-			await client.clearSession();
-			sentMessageIds.clear();
-			updateStatus();
-			return {
-				content: [
-					{
-						type: "text",
-						text: "WhatsApp session cleared successfully. All credentials and message histories have been wiped from disk, and connection has been closed.",
-					},
-				],
-			};
-		},
-	});
-
-	// Register /whatsapp slash command
+	// Register unified /whatsapp slash command
 	pi.registerCommand("whatsapp", {
-		description:
-			"Manage WhatsApp connection and messages (usage: /whatsapp [connect|status|qr|disconnect|clear|logout|send|messages|mode])",
+		description: "Manage WhatsApp connection and pairing (usage: /whatsapp [connect|status|qr|send|disconnect|clear|mode])",
 		handler: async (args, ctx) => {
 			currentContext = ctx;
 			const trimmed = args?.trim() ?? "";
@@ -382,17 +604,15 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 				}
 
 				case "clear":
-				case "clear-session":
 				case "logout": {
 					const confirmed = await ctx.ui.confirm(
 						"Confirm Clear WhatsApp Session",
-						"Are you sure you want to clear the WhatsApp session? This will disconnect, delete all saved login credentials from disk, and wipe message history.",
+						"Are you sure you want to clear the WhatsApp session? This will disconnect and delete all saved login credentials from disk.",
 					);
 					if (confirmed) {
 						await client.clearSession();
-						sentMessageIds.clear();
 						updateStatus(ctx);
-						ctx.ui.notify("WhatsApp session, credentials, and message history cleared.", "info");
+						ctx.ui.notify("WhatsApp session and credentials cleared.", "info");
 					}
 					break;
 				}
@@ -435,7 +655,6 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 				case "send": {
 					const recipient = parts[1];
 					const messageText = parts.slice(2).join(" ");
-
 					if (!recipient || !messageText) {
 						ctx.ui.notify("Usage: /whatsapp send <chat_id> <message_text>", "warning");
 						return;
@@ -443,37 +662,10 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 
 					const res = await client.sendTextMessage(recipient, messageText);
 					if (res.success) {
-						if (res.id) sentMessageIds.add(res.id);
 						ctx.ui.notify(`Message sent to ${res.toJid || recipient}!`, "info");
 					} else {
 						ctx.ui.notify(`Failed: ${res.error}`, "error");
 					}
-					break;
-				}
-
-				case "messages": {
-					const limitNum = parts[1] ? parseInt(parts[1], 10) : 10;
-					const msgs = client.getRecentMessages({ limit: limitNum });
-					if (msgs.length === 0) {
-						ctx.ui.notify("No recent messages recorded.", "info");
-						return;
-					}
-
-					const listStr = msgs
-						.map((m) => {
-							const sender = m.fromMe ? "Me" : m.senderName || m.senderNumber;
-							return `• [${new Date(m.timestamp).toLocaleTimeString()}] ${sender}: ${m.text || `[${m.type}]`}`;
-						})
-						.join("\n");
-
-					pi.sendMessage(
-						{
-							customType: "whatsapp-recent-messages",
-							content: `**Recent WhatsApp Messages (${msgs.length}):**\n\n${listStr}`,
-							display: true,
-						},
-						{ deliverAs: "followUp" },
-					);
 					break;
 				}
 
@@ -490,47 +682,22 @@ export default function whatsappExtension(pi: ExtensionAPI): void {
 
 				case "status":
 				default: {
-					if (ctx.mode === "tui" && !subcommand) {
-						await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-							return new WhatsAppStatusComponent(client, theme, () => done());
-						});
-					} else {
-						const status = client.getStatus();
-						pi.sendMessage(
-							{
-								customType: "whatsapp-status",
-								content:
-									`**WhatsApp Connection Status:**\n` +
-									`- **Status:** ${status.status}\n` +
-									`- **User:** ${status.userName || "N/A"} (${status.userJid || "N/A"})\n` +
-									`- **Relay Mode:** \`${relayMode}\`\n` +
-									`- **Message Buffer:** ${status.messageCount} messages\n` +
-									`- **Commands:** \`/whatsapp connect\`, \`/whatsapp qr\`, \`/whatsapp disconnect\`, \`/whatsapp logout\``,
-								display: true,
-							},
-							{ deliverAs: "followUp" },
-						);
-					}
+					const status = client.getStatus();
+					pi.sendMessage(
+						{
+							customType: "whatsapp-status",
+							content:
+								`**WhatsApp Status:**\n` +
+								`- **Connection:** ${status.status}\n` +
+								`- **User:** ${status.userName || "N/A"} (${status.userJid || "N/A"})\n` +
+								`- **Relay Mode:** \`${relayMode}\`\n` +
+								`- **Commands:** \`/whatsapp connect\`, \`/whatsapp qr\`, \`/whatsapp send\`, \`/whatsapp disconnect\`, \`/whatsapp clear\``,
+							display: true,
+						},
+						{ deliverAs: "followUp" },
+					);
 					break;
 				}
-			}
-		},
-	});
-
-	// Register /whatsapp-clear standalone command
-	pi.registerCommand("whatsapp-clear", {
-		description: "Clear WhatsApp session, wipe stored credentials, and disconnect",
-		handler: async (_args, ctx) => {
-			currentContext = ctx;
-			const confirmed = await ctx.ui.confirm(
-				"Confirm Clear WhatsApp Session",
-				"Are you sure you want to clear the WhatsApp session? This will disconnect, delete all saved login credentials from disk, and wipe message history.",
-			);
-			if (confirmed) {
-				await client.clearSession();
-				sentMessageIds.clear();
-				updateStatus(ctx);
-				ctx.ui.notify("WhatsApp session, credentials, and message history cleared.", "info");
 			}
 		},
 	});
