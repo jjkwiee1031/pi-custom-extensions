@@ -4,7 +4,7 @@
   "description": "A comprehensive agent framework with plan-mode exploration and subagent delegation capabilities.",
   "main": "index.js",
   "scripts": {
-    "test": "node --experimental-strip-types tests/whatsapp-extension.test.mts"
+    "test": "node --experimental-strip-types tests/whatsapp-extension.test.mts && node --experimental-strip-types tests/subagent-extension.test.mts"
   },
   "repository": {
     "type": "git",

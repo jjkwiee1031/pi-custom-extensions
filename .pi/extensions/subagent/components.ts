@@ -4,7 +4,7 @@
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import type { SubagentDelegation } from "./utils.ts";
+import type { SubagentDelegation } from "./index.ts";
 
 /**
  * Interactive TUI component to view subagent delegations.
