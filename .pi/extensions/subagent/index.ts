@@ -428,7 +428,13 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 				createdAt: Date.now(),
 			};
 
-			delegations.push(delegation);
+			// Upsert (update or insert) delegation to prevent duplicate IDs
+			const existingIdx = delegations.findIndex((d) => d.id === id);
+			if (existingIdx >= 0) {
+				delegations[existingIdx] = delegation;
+			} else {
+				delegations.push(delegation);
+			}
 			updateStatus(ctx);
 			persistState();
 
