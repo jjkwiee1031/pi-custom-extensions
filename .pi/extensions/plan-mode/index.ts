@@ -5,163 +5,188 @@
  * When enabled, file editing/writing tools are disabled, and bash is restricted
  * to safe inspection commands.
  *
- * Features:
- * - /plan command or Ctrl+Alt+P shortcut to toggle plan mode
- * - Full-featured /todos command to view or manually manage todos
- * - Integrated `todo` tool: The ONLY way the agent can modify the todo list
- * - Explicit prompt instructions guiding the agent on what tools to call next
- * - Live checklist widget above the editor showing current tasks and status
- * - Status bar indicator showing completion count and percentage
- * - Interactive TUI modal to review the plan checklist
- * - Full session persistence and resume support
+ * Architecture:
+ * - index.ts: Core extension module, safe command validation, todo tool, and lifecycle hooks.
+ * - components.ts: Interactive TUI list component for /todos.
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { TextContent } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import {
-	cleanStepText,
-	extractTodoItems,
-	isSafeCommand,
-	type TodoItem,
-	type TodoStatus,
-} from "./utils.ts";
+import { TodoListComponent } from "./components.ts";
 
-// Tools configuration
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "todo", "ask_questions", "questionnaire"];
-const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write", "todo"];
-const PLAN_MODE_DISABLED_TOOLS = new Set<string>(["edit", "write"]);
-const PLAN_MANAGED_TOOLS = new Set<string>([...PLAN_MODE_TOOLS, ...NORMAL_MODE_TOOLS]);
+export type TodoStatus = "pending" | "in_progress" | "completed";
 
-interface PlanModeState {
+export interface TodoItem {
+	step: number;
+	text: string;
+	status: TodoStatus;
+	completed: boolean;
+}
+
+export interface PlanModeState {
 	enabled: boolean;
 	todos?: TodoItem[];
 	executing?: boolean;
 	toolsBeforePlanMode?: string[];
 }
 
+// Tool management constants
+const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "todo", "ask_questions", "questionnaire"];
+const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write", "todo"];
+const PLAN_MODE_DISABLED_TOOLS = new Set<string>(["edit", "write"]);
+const PLAN_MANAGED_TOOLS = new Set<string>([...PLAN_MODE_TOOLS, ...NORMAL_MODE_TOOLS]);
+
+// Destructive commands blocked in plan mode
+const DESTRUCTIVE_PATTERNS = [
+	/\brm\b/i,
+	/\brmdir\b/i,
+	/\bmv\b/i,
+	/\bcp\b/i,
+	/\bmkdir\b/i,
+	/\btouch\b/i,
+	/\bchmod\b/i,
+	/\bchown\b/i,
+	/\bchgrp\b/i,
+	/\bln\b/i,
+	/\btee\b/i,
+	/\btruncate\b/i,
+	/\bdd\b/i,
+	/\bshred\b/i,
+	/(^|[^<])>(?!>)/,
+	/>>/,
+	/\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
+	/\byarn\s+(add|remove|install|publish)/i,
+	/\bpnpm\s+(add|remove|install|publish)/i,
+	/\bpip\s+(install|uninstall)/i,
+	/\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
+	/\bbrew\s+(install|uninstall|upgrade)/i,
+	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
+	/\bsudo\b/i,
+	/\bsu\b/i,
+	/\bkill\b/i,
+	/\bpkill\b/i,
+	/\bkillall\b/i,
+	/\breboot\b/i,
+	/\bshutdown\b/i,
+	/\bsystemctl\s+(start|stop|restart|enable|disable)/i,
+	/\bservice\s+\S+\s+(start|stop|restart)/i,
+	/\b(vim?|nano|emacs|code|subl)\b/i,
+];
+
+// Safe read-only commands allowed in plan mode
+const SAFE_PATTERNS = [
+	/^\s*cat\b/,
+	/^\s*head\b/,
+	/^\s*tail\b/,
+	/^\s*less\b/,
+	/^\s*more\b/,
+	/^\s*grep\b/,
+	/^\s*find\b/,
+	/^\s*ls\b/,
+	/^\s*pwd\b/,
+	/^\s*echo\b/,
+	/^\s*printf\b/,
+	/^\s*wc\b/,
+	/^\s*sort\b/,
+	/^\s*uniq\b/,
+	/^\s*diff\b/,
+	/^\s*file\b/,
+	/^\s*stat\b/,
+	/^\s*du\b/,
+	/^\s*df\b/,
+	/^\s*tree\b/,
+	/^\s*which\b/,
+	/^\s*whereis\b/,
+	/^\s*type\b/,
+	/^\s*env\b/,
+	/^\s*printenv\b/,
+	/^\s*uname\b/,
+	/^\s*whoami\b/,
+	/^\s*id\b/,
+	/^\s*date\b/,
+	/^\s*cal\b/,
+	/^\s*uptime\b/,
+	/^\s*ps\b/,
+	/^\s*top\b/,
+	/^\s*htop\b/,
+	/^\s*free\b/,
+	/^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get)/i,
+	/^\s*git\s+ls-/i,
+	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)/i,
+	/^\s*yarn\s+(list|info|why|audit)/i,
+	/^\s*node\s+--version/i,
+	/^\s*python\s+--version/i,
+	/^\s*curl\s/i,
+	/^\s*wget\s+-O\s*-/i,
+	/^\s*jq\b/,
+	/^\s*sed\s+-n/i,
+	/^\s*awk\b/,
+	/^\s*rg\b/,
+	/^\s*fd\b/,
+	/^\s*bat\b/,
+	/^\s*eza\b/,
+];
+
+/**
+ * Checks whether a shell command is read-only safe in plan mode.
+ */
+export function isSafeCommand(command: string): boolean {
+	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
+	const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
+	return !isDestructive && isSafe;
+}
+
+/**
+ * Normalizes and formats step description text.
+ */
+export function cleanStepText(text: string): string {
+	let cleaned = text
+		.replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1") // Remove bold/italic
+		.replace(/`([^`]+)`/g, "$1") // Remove code
+		.trim()
+		.replace(
+			/^(Use|Run|Execute|Create|Write|Read|Check|Verify|Update|Modify|Add|Remove|Delete|Install)\s+(the\s+)?/i,
+			"",
+		)
+		.replace(/\s+/g, " ")
+		.trim();
+
+	if (cleaned.length > 0) {
+		cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+	}
+	if (cleaned.length > 50) {
+		cleaned = `${cleaned.slice(0, 47)}...`;
+	}
+	return cleaned;
+}
+
+// Tool schema: streamlined action set (removed redundant 'toggle')
 const TodoActionSchema = Type.Union([
 	Type.Literal("list"),
 	Type.Literal("add"),
 	Type.Literal("start"),
 	Type.Literal("done"),
-	Type.Literal("toggle"),
 	Type.Literal("set"),
 	Type.Literal("clear"),
 ]);
 
 const TodoParamsSchema = Type.Object({
 	action: TodoActionSchema,
-	id: Type.Optional(Type.Number({ description: "Step number / ID (for start, done, toggle)" })),
+	id: Type.Optional(Type.Number({ description: "Step number / ID (for start, done)" })),
 	text: Type.Optional(Type.String({ description: "Task description (for add)" })),
-	todos: Type.Optional(Type.Array(Type.String(), { description: "Array of task descriptions to set the full plan (for set)" })),
+	todos: Type.Optional(
+		Type.Array(Type.String(), { description: "Array of task descriptions to initialize the plan (for set)" }),
+	),
 });
-
-// Type guard for assistant messages
-function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
-	return m.role === "assistant" && Array.isArray(m.content);
-}
-
-// Extract text content from an assistant message
-function getTextContent(message: AssistantMessage): string {
-	return message.content
-		.filter((block): block is TextContent => block.type === "text")
-		.map((block) => block.text)
-		.join("\n");
-}
-
-/**
- * Interactive UI Component for /todos
- */
-class TodoListComponent {
-	private todos: TodoItem[];
-	private theme: Theme;
-	private onClose: () => void;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
-
-	constructor(todos: TodoItem[], theme: Theme, onClose: () => void) {
-		this.todos = todos;
-		this.theme = theme;
-		this.onClose = onClose;
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "enter") || data === "q") {
-			this.onClose();
-		}
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
-			return this.cachedLines;
-		}
-
-		const lines: string[] = [];
-		const th = this.theme;
-
-		lines.push("");
-		const title = th.fg("accent", " Plan Execution Todos ");
-		const headerLine =
-			th.fg("borderMuted", "─".repeat(3)) + title + th.fg("borderMuted", "─".repeat(Math.max(0, width - 26)));
-		lines.push(truncateToWidth(headerLine, width));
-		lines.push("");
-
-		if (this.todos.length === 0) {
-			lines.push(truncateToWidth(`  ${th.fg("dim", "No active plan todos. Create a plan with /plan")}`, width));
-		} else {
-			const done = this.todos.filter((t) => t.completed).length;
-			const inProg = this.todos.filter((t) => t.status === "in_progress").length;
-			const total = this.todos.length;
-			const percent = Math.round((done / total) * 100);
-
-			let summary = `  ${th.fg("muted", `${done}/${total} completed (${percent}%)`)}`;
-			if (inProg > 0) {
-				summary += th.fg("warning", ` • ${inProg} in progress`);
-			}
-			lines.push(truncateToWidth(summary, width));
-			lines.push("");
-
-			for (const todo of this.todos) {
-				let icon = th.fg("dim", "○");
-				let itemText = th.fg("text", todo.text);
-
-				if (todo.completed) {
-					icon = th.fg("success", "✓");
-					itemText = th.fg("dim", th.strikethrough(todo.text));
-				} else if (todo.status === "in_progress") {
-					icon = th.fg("warning", "▶");
-					itemText = th.bold(th.fg("accent", todo.text));
-				}
-
-				const id = th.fg("dim", `#${todo.step}`);
-				lines.push(truncateToWidth(`  ${icon} ${id} ${itemText}`, width));
-			}
-		}
-
-		lines.push("");
-		lines.push(truncateToWidth(`  ${th.fg("dim", "Press Escape, Enter, or 'q' to close")}`, width));
-		lines.push("");
-
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-}
 
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
 	let executionMode = false;
 	let todoItems: TodoItem[] = [];
 	let toolsBeforePlanMode: string[] | undefined;
-	let planPromptedInThisTurn = false;
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only exploration and planning)",
@@ -170,7 +195,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	});
 
 	function updateStatus(ctx: ExtensionContext): void {
-		// Footer status
 		if (executionMode && todoItems.length > 0) {
 			const completed = todoItems.filter((t) => t.completed).length;
 			const percent = Math.round((completed / todoItems.length) * 100);
@@ -384,8 +408,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Register keyboard shortcut
-	pi.registerShortcut(Key.ctrlAlt("p"), {
+	// Register keyboard shortcut safely with fallback
+	const shortcutKey = typeof (Key as any)?.ctrlAlt === "function" ? (Key as any).ctrlAlt("p") : "ctrl+alt+p";
+	pi.registerShortcut(shortcutKey, {
 		description: "Toggle plan mode",
 		handler: async (ctx) => togglePlanMode(ctx),
 	});
@@ -395,20 +420,19 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	): Promise<"execute" | "stay" | { refine: string }> {
 		if (todoItems.length === 0) return "stay";
 
-		// 1. Immediately send the plan message to the chat transcript before asking for choice
+		// 1. Send proposed plan message to the chat transcript
 		const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
-		const planTodoListMessage = {
+		pi.sendMessage({
 			customType: "plan-todo-list",
 			content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
 			display: true,
-		};
-		pi.sendMessage(planTodoListMessage);
+		});
 
-		// 2. Update widget so the checklist is immediately visible above the editor
+		// 2. Update widget so checklist is immediately visible above the prompt editor
 		const widgetLines = todoItems.map((item) => `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`);
 		ctx.ui.setWidget("plan-todos", widgetLines);
 
-		// 3. Display the plan steps directly inside the selection prompt so the user sees it while choosing
+		// 3. Prompt user for approval
 		const planSummary = todoItems.map((t) => `  ${t.step}. ${t.text}`).join("\n");
 		const selectPrompt = `📋 Plan Ready (${todoItems.length} steps):\n\n${planSummary}\n\nWhat would you like to do?`;
 
@@ -442,12 +466,12 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		return "stay";
 	}
 
-	// Register the `todo` tool for the LLM — the ONLY way the agent modifies todos
+	// Register the `todo` tool for the LLM
 	pi.registerTool({
 		name: "todo",
 		label: "Plan Todo",
 		description:
-			"Manage and track the plan execution todo list. Actions: list (view todos), add (add step), start (mark step in-progress by id), done (mark step completed by id), toggle (toggle step completion by id), set (set initial list of todos), clear (clear todos). Calling this tool is REQUIRED to update plan progress.",
+			"Manage and track the plan execution todo list. Actions: list (view todos), add (add step), start (mark step in-progress by id), done (mark step completed by id), set (initialize plan todos), clear (clear todos).",
 		parameters: TodoParamsSchema,
 		executionMode: "sequential",
 
@@ -498,12 +522,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 						status: "pending",
 						completed: false,
 					}));
-					planPromptedInThisTurn = true;
 					updateStatus(ctx);
 					persistState();
 
 					if (ctx.hasUI) {
-						// Interactively pause the agent run and wait for user approval right now!
 						const decision = await promptUserForPlan(ctx);
 
 						if (decision === "execute") {
@@ -529,7 +551,6 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 							};
 						}
 
-						// decision === "stay"
 						return {
 							content: [
 								{
@@ -615,8 +636,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					};
 				}
 
-				case "done":
-				case "toggle": {
+				case "done": {
 					if (params.id === undefined) {
 						return {
 							content: [{ type: "text", text: "Error: id is required for action 'done'." }],
@@ -628,13 +648,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 							content: [{ type: "text", text: `Error: step #${params.id} not found.` }],
 						};
 					}
-					if (params.action === "toggle") {
-						item.completed = !item.completed;
-						item.status = item.completed ? "completed" : "pending";
-					} else {
-						item.completed = true;
-						item.status = "completed";
-					}
+					item.completed = true;
+					item.status = "completed";
 					updateStatus(ctx);
 					persistState();
 
@@ -763,7 +778,7 @@ Once the plan is approved by the user, full write/edit access will be unlocked.`
 		};
 	});
 
-	// Inject plan or execution context before agent turn starts with explicit next tool instructions
+	// Inject plan or execution context before agent turn starts with explicit tool instructions
 	pi.on("before_agent_start", async () => {
 		if (planModeEnabled) {
 			return {
@@ -777,19 +792,11 @@ Restrictions:
 - Bash is strictly restricted to read-only inspection commands (cat, ls, grep, find, git status, git log, git diff, etc.)
 
 Instructions on what tools to call:
-1. Investigation: First, call \`read\`, \`grep\`, \`find\`, \`ls\`, or safe read-only \`bash\` commands to inspect the codebase thoroughly.
-2. Clarification: If requirements or design decisions need user feedback, call \`ask_questions\` / \`questionnaire\` or ask directly in chat.
-3. Initialize the Plan Todo List: Once your investigation and analysis are complete, you MUST call the \`todo\` tool with action "set" to initialize the execution checklist:
+1. Investigation: Call \`read\`, \`grep\`, \`find\`, \`ls\`, or safe read-only \`bash\` commands to inspect the codebase thoroughly.
+2. Clarification: If requirements or design decisions need user feedback, ask directly in chat.
+3. Initialize the Plan: Once your investigation is complete, you MUST call the \`todo\` tool with action "set" to establish the checklist:
    \`todo(action: "set", todos: ["Step 1 description", "Step 2 description", "Step 3 description", ...])\`
-   Calling \`todo\` with action "set" is REQUIRED to establish the plan and advance to execution.
-4. Also present your plan clearly in your response text under a "Plan:" header with numbered steps:
-
-Plan:
-1. First step description
-2. Second step description
-3. Third step description
-
-CRITICAL: Do NOT remain analyzing indefinitely. Once you have enough context, call \`todo(action: "set", todos: [...])\` to set the plan and transition to execution. Do NOT attempt to modify files directly in plan mode.`,
+   Calling \`todo(action: "set")\` is REQUIRED to trigger user approval and advance to execution mode.`,
 					display: false,
 				},
 			};
@@ -836,105 +843,6 @@ IMPORTANT: You MUST call the \`todo\` tool to update progress and modify the che
 		}
 	});
 
-	function hasQuestionToolCall(message: AssistantMessage): boolean {
-		if (!Array.isArray(message.content)) return false;
-		return message.content.some((block) => {
-			const b = block as Record<string, unknown>;
-			const name = String(b.name ?? b.toolName ?? "");
-			return (
-				(b.type === "toolCall" || b.type === "tool_call" || b.type === "toolUse") &&
-				/question|ask/i.test(name)
-			);
-		});
-	}
-
-	function isAskingQuestion(text: string): boolean {
-		const trimmed = text.trim();
-		if (!trimmed) return false;
-
-		// Check if message ends with a question mark
-		const lastParagraph = trimmed.split(/\n\s*\n/).pop()?.trim() ?? "";
-		if (/\?\s*(\*{1,2}|_{1,2}|["'`])?\s*$/.test(lastParagraph)) {
-			return true;
-		}
-
-		// Check for question or clarification sections
-		if (/(?:questions?|clarifications?)\s*(?:for you|needed|to clarify|before we (?:proceed|begin|start))?:/i.test(trimmed)) {
-			return true;
-		}
-
-		// Check for closing question prompts
-		if (/(?:please\s+)?(?:let me know|clarify|confirm)\s+which\b/i.test(lastParagraph)) {
-			return true;
-		}
-
-		return false;
-	}
-
-	// Handle plan creation dialog and plan completion
-	pi.on("agent_end", async (event, ctx) => {
-		if (!planModeEnabled || !ctx.hasUI) return;
-
-		// Find the latest assistant message
-		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
-		if (!lastAssistant) return;
-
-		// If the user was already prompted during todo(action: "set") in this turn, skip
-		if (planPromptedInThisTurn) {
-			planPromptedInThisTurn = false;
-			return;
-		}
-
-		// 1. If the assistant called a question tool, it is actively asking questions: do not prompt
-		if (hasQuestionToolCall(lastAssistant)) return;
-
-		const assistantText = getTextContent(lastAssistant);
-
-		// 2. If the assistant text is asking a question or requesting clarification: do not prompt
-		if (isAskingQuestion(assistantText)) return;
-
-		// 3. Check if a plan was output in text
-		let planSetInThisTurn = false;
-		const extracted = extractTodoItems(assistantText);
-		if (extracted.length > 0) {
-			todoItems = extracted;
-			planSetInThisTurn = true;
-		}
-
-		// Only prompt if a plan was actually initialized or formulated in THIS turn
-		if (!planSetInThisTurn || todoItems.length === 0) {
-			return;
-		}
-		persistState();
-
-		const decision = await promptUserForPlan(ctx);
-		if (decision === "execute") {
-			const firstTodoItem = todoItems[0];
-			const remainingList = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
-			const execMessage = `Execute the plan.
-
-Plan Todos:
-${remainingList}
-
-Next tools to call:
-1. Step 1 is now active: "${firstTodoItem?.text}".
-2. Call \`read\`, \`edit\`, \`write\`, or \`bash\` to implement Step 1.
-3. Call \`todo(action: "done", id: 1)\` once Step 1 is verified and complete.
-4. Next, call \`todo(action: "start", id: 2)\` for the next step.
-
-Remember: Call the \`todo\` tool to update progress as you complete each step.`;
-
-			pi.sendMessage(
-				{ customType: "plan-mode-execute", content: execMessage, display: true },
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
-		} else if (typeof decision === "object" && "refine" in decision) {
-			if (decision.refine.trim()) {
-				pi.sendUserMessage(decision.refine.trim(), { deliverAs: "followUp" });
-			}
-		}
-	});
-
 	// Restore state on session start/resume
 	pi.on("session_start", async (_event, ctx) => {
 		if (pi.getFlag("plan") === true) {
@@ -943,7 +851,6 @@ Remember: Call the \`todo\` tool to update progress as you complete each step.`;
 
 		const entries = ctx.sessionManager.getEntries();
 
-		// Restore persisted state if available
 		const planModeEntry = entries
 			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "plan-mode")
 			.pop() as { data?: PlanModeState } | undefined;

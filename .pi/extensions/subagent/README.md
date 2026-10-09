@@ -1,14 +1,15 @@
 # Subagent Extension for Pi
 
-A standalone extension that lets the agent **delegate sub-tasks to a sub-agent turn**, optionally linking the delegation to an active `plan-mode` todo step so progress stays in sync.
+A standalone extension that lets the agent **delegate sub-tasks to a sub-agent turn** in isolated child `pi` processes, seamlessly adapting to the `plan-mode` todo list extension.
 
 ## Features
 
-- **`subagent` tool**: The LLM calls `subagent` to hand a sub-task to a sub-agent turn.
-- **Plan-mode integration**: Link a subagent call to a `plan-mode` todo step (`step`), so the step is auto-marked in-progress/completed as the sub-agent work proceeds.
-- **`/subagent` command**: Manually spawn a sub-agent turn for a step without an LLM tool call.
-- **State tracking**: Each sub-agent delegation is stored in the session so delegations survive pauses/resumes and branch correctly.
-- **Independent of plan mode**: Works without `plan-mode` installed; when both are installed, the two track each other's state.
+- **Lean `subagent` tool**: Direct, actionless tool invocation `{ task, role?, instructions?, step? }`.
+- **Todo List Adaptation**: Link a subagent call to a `plan-mode` todo step (`step`) to automatically advance step status from `start` to `done`.
+- **Process Management & Cancellation**: Spawns isolated child `pi` processes with `AbortSignal` cancellation support and `stderr` diagnostics.
+- **Dedicated Commands**: Full terminal control with `/subagent`, `/sub-switch`, `/sub-return`, and `/workflow`.
+- **State persistence**: Delegations persist across session restarts and branch switches.
+- **2-File Architecture**: Clean separation between core logic (`index.ts`) and terminal UI modal (`components.ts`).
 
 ---
 
@@ -16,89 +17,60 @@ A standalone extension that lets the agent **delegate sub-tasks to a sub-agent t
 
 ```typescript
 {
-  "action": "start" | "done",
-  "subagentId": number,
-  "step": number,        // optional: plan-mode step to link
-  "task": string,        // sub-agent task description
-  "instructions": string // optional extra guidance
+  task: string;           // sub-agent task description (required)
+  role?: string;          // specialist agent role from .pi/agents/*.md
+  instructions?: string;  // optional extra guidance
+  step?: number;          // optional plan-mode todo step number to link
 }
 ```
-
-Actions:
-
-| Action | Description |
-|---|---|
-| `start` | Spawn a sub-agent turn for `task`. If `step` is provided, the plan-mode step is marked in-progress. |
-| `done` | Report sub-agent completion. If `step` is provided, the linked plan-mode step is marked completed. |
-| `list` | List all sub-agent delegations for the current session. |
-| `delegate` | (Convenience) Start a sub-agent turn **and** link it to the currently active plan-mode step. |
 
 ### Usage
 
-The agent calls the tool when it wants a sub-agent to work on a piece of the task:
+The agent delegates a sub-task directly:
 
 ```json
 {
-  "action": "start",
-  "subagentId": 1,
   "task": "Write the user-facing greeting component",
+  "role": "worker",
   "instructions": "Use Tailwind CSS and keep it under 200 lines."
 }
 ```
 
-When a plan is active in `plan-mode`, link the delegation to the step being executed:
+When linked to a plan-mode step:
 
 ```json
 {
-  "action": "start",
-  "subagentId": 1,
-  "step": 3,
-  "task": "Write the user-facing greeting component",
-  "instructions": "Use Tailwind CSS and keep it under 200 lines."
+  "task": "Write unit tests for authentication service",
+  "step": 3
 }
 ```
 
-Then, when the sub-agent is finished:
+The extension automatically calls `todo(action: "start", id: 3)` before execution and `todo(action: "done", id: 3)` upon completion.
 
-```json
-{
-  "action": "done",
-  "subagentId": 1
-}
-```
-
-Calling `subagent(action: "delegate")` while a plan step is in-progress spawns the turn and attaches it to that step automatically.
+---
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `/subagent` | Start a sub-agent turn (prompt for the task). |
+| `/subagent` | Prompt interactively for a task. |
 | `/subagent <task>` | Start a sub-agent turn with the given task. |
-| `/subagent [role] <task>` | Start a sub-agent turn using a specialist role (e.g., `planner`, `worker`). |
-| `/subagent list` | List active sub-agent delegations. |
+| `/subagent <role> <task>` | Start a sub-agent turn using a specialist role (e.g., `planner`, `worker`). |
+| `/subagent list` | View sub-agent delegations (interactive TUI card or text). |
 | `/subagent clear` | Clear all sub-agent delegation state. |
 | `/subagent roles` | List available specialist roles from `.pi/agents/*.md`. |
 | `/sub-switch <role or #id>` | Switch to a sub-agent's session transcript. |
-| `/sub-return` | Return to the parent session. |
+| `/sub-return` | Return to the parent session transcript. |
 | `/workflow load <file>` | Load a multi-agent workflow pipeline (e.g. `workflow.json`). |
 | `/workflow run <task>` | Sequentially execute the loaded multi-agent pipeline. |
 
-## Keyboard shortcut
+## Keyboard Shortcut
 
-- `Ctrl+Alt+S` — Start a sub-agent turn (prompt for the task).
+- `Ctrl+Alt+S` — Start a sub-agent turn interactively.
 
-## Dependencies
-
-No npm dependencies required. Reads plan-mode's in-memory state when `plan-mode` is installed; if `plan-mode` is absent, `subagent` degrades gracefully and still functions.
-
-## Files
+## Architecture
 
 | File | Purpose |
 |---|---|
-| `index.ts` | Extension entry point: registrations for tool, commands, shortcut, and lifecycle hooks. |
-| `utils.ts` | State helpers, agent discovery (`.pi/agents/*.md`), session file paths, and plan-mode extraction. |
-| `process.ts` | Child process spawning (`pi --mode json`) and live stream capture. |
-| `workflow.ts` | Sequential multi-agent workflow loading and pipeline runner. |
-| `components.ts` | TUI interactive delegation modal (`SubagentListComponent`). |
-| `README.md` | This documentation. |
+| `index.ts` | Core extension: tool registration, child process spawning, workflow engine, commands, and hooks. |
+| `components.ts` | Interactive TUI modal component (`SubagentListComponent`). |

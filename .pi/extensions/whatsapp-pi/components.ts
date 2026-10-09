@@ -1,22 +1,28 @@
 /**
- * TUI components for WhatsApp Pi Extension
+ * Interactive TUI component for WhatsApp QR code pairing and status display.
  */
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import type { WhatsAppClient } from "./client.ts";
 
-/**
- * Interactive TUI component to view WhatsApp QR code and connection status
- */
+export interface WhatsAppClientView {
+	getStatus(): {
+		status: "disconnected" | "connecting" | "qr_ready" | "connected";
+		userJid: string | null;
+		userName: string | null;
+		authDir: string;
+		currentQrAscii: string | null;
+	};
+}
+
 export class WhatsAppStatusComponent {
-	private client: WhatsAppClient;
+	private client: WhatsAppClientView;
 	private theme: Theme;
 	private onClose: () => void;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(client: WhatsAppClient, theme: Theme, onClose: () => void) {
+	constructor(client: WhatsAppClientView, theme: Theme, onClose: () => void) {
 		this.client = client;
 		this.theme = theme;
 		this.onClose = onClose;
@@ -56,7 +62,8 @@ export class WhatsAppStatusComponent {
 		if (statusInfo.status === "connected") {
 			statusBadge = th.fg("success", "● Connected");
 			if (statusInfo.userJid) {
-				statusBadge += ` as ${th.bold(statusInfo.userName ?? statusInfo.userJid)}`;
+				const displayName = statusInfo.userName ?? statusInfo.userJid;
+				statusBadge += ` as ${th.bold(displayName)}`;
 			}
 		} else if (statusInfo.status === "connecting") {
 			statusBadge = th.fg("warning", "◌ Connecting to WhatsApp...");
@@ -68,10 +75,9 @@ export class WhatsAppStatusComponent {
 
 		lines.push(truncateToWidth(`  Status: ${statusBadge}`, width));
 		lines.push(truncateToWidth(`  Auth Directory: ${th.fg("dim", statusInfo.authDir)}`, width));
-		lines.push(truncateToWidth(`  Message History: ${th.fg("dim", `${statusInfo.messageCount} messages`)}`, width));
 		lines.push("");
 
-		// If QR code is available, display it
+		// If QR code is ready, display it
 		if (statusInfo.status === "qr_ready" && statusInfo.currentQrAscii) {
 			lines.push(truncateToWidth(`  ${th.bold(th.fg("accent", "Scan with WhatsApp on your phone:"))}`, width));
 			lines.push(truncateToWidth(`  ${th.fg("dim", "1. Open WhatsApp > Settings > Linked Devices")}`, width));

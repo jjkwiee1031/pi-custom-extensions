@@ -73,7 +73,7 @@ flowchart TD
     subgraph WhatsAppRuntime [WhatsApp Gateway]
         WA --> Baileys["Baileys WebSocket Engine"]
         WA --> AuthStore[".pi/whatsapp_auth/ (Credentials)"]
-        WA --> WATools["Agent Tools: whatsapp_send, whatsapp_read, whatsapp_status"]
+        WA --> WATools["Agent Tool: whatsapp_send"]
         WA --> WARelay["Message Relay (auto / notify / off)"]
         Baileys <--> WhatsAppNet([WhatsApp Network])
     end
@@ -108,13 +108,13 @@ flowchart TD
 ### 3. WhatsApp Integration Extension
 - **Baileys WebSocket Engine**: Multi-device WhatsApp Web connectivity via `@whiskeysockets/baileys`.
 - **Flexible Pairing**: Scan QR codes directly in the terminal log or launch a full-screen interactive TUI modal (`/whatsapp qr`).
-- **Agent Tools**: Tools for sending text/media (`whatsapp_send`), reading conversation histories (`whatsapp_read`), checking health (`whatsapp_status`), and resetting credentials (`whatsapp_clear`).
+- **Agent Tool**: Single focused tool for sending text and media attachments (`whatsapp_send`).
 - **Media Attachments**: Send images, PDFs, documents, audio clips, and videos directly from local disk.
-- **Configurable Relaying**:
-  - `auto`: Ingests incoming WhatsApp messages directly into the agent context loop to enable conversational agent interaction.
-  - `notify`: Non-intrusive toast notification for new messages.
-  - `off`: Silently stores messages in the history buffer.
-- **Status Bar Indicator**: Live footer status (`🟢 WA: connected`, `🟡 WA: connecting`, `▲ WA: scan QR`, `⚪ WA: offline`).
+- **Incoming Note to Self Relaying**:
+  - `auto`: Ingests incoming "Note to Self" messages directly into the agent context loop to execute remote commands.
+  - `notify`: Toast notifications for new incoming notes without interrupting.
+  - `off`: Ignores incoming messages silently.
+- **Status Bar Indicator**: Live footer status (`[WA: connected]`, `[WA: connecting]`, `[WA: scan QR]`).
 
 ---
 
@@ -284,13 +284,11 @@ Pipelines define structured, sequential multi-agent chains where the output of o
 |---|---|
 | `/whatsapp connect` | Initialize connection and display QR code |
 | `/whatsapp qr` | View full-screen interactive QR modal |
-| `/whatsapp status` | Display connection status, phone number, and message count |
+| `/whatsapp status` | Display connection status, user name, and relay mode |
 | `/whatsapp send <phone> <message>` | Send a message directly from the command bar |
-| `/whatsapp messages [limit]` | Print recent incoming and outgoing messages |
 | `/whatsapp mode [notify\|auto\|off]` | Switch incoming message relaying mode |
 | `/whatsapp disconnect` | Disconnect active WebSocket connection |
-| `/whatsapp logout` | Disconnect and clear credentials from disk |
-| `/whatsapp clear` | Disconnect, delete credentials, and wipe message history |
+| `/whatsapp clear` | Disconnect and clear credentials from disk |
 
 ---
 
@@ -353,29 +351,11 @@ Sends text messages and local media files to a phone number or group:
 ```typescript
 {
   to: string,           // Phone number (+123456789), JID, or group JID
-  message?: string,     // Text body
+  message: string,      // Text body
   mediaPath?: string,   // Local absolute or relative path to media
   caption?: string      // Media caption
 }
 ```
-
----
-
-### 4. `whatsapp_read`
-Reads message history from stored conversations:
-```typescript
-{
-  chat?: string,        // Filter by phone number or JID
-  limit?: number,       // Number of messages (default: 20)
-  incomingOnly?: boolean// Retrieve only incoming messages
-}
-```
-
----
-
-### 5. `whatsapp_status` & `whatsapp_clear`
-- `whatsapp_status`: Returns connection state, user JID, and message statistics.
-- `whatsapp_clear`: Logs out and wipes local credential files.
 
 ---
 
@@ -395,10 +375,11 @@ Reads message history from stored conversations:
 | `/workflow run <task>` | Subagent | Execute sequential workflow |
 | `/whatsapp connect` | WhatsApp | Connect and generate pairing QR |
 | `/whatsapp qr` | WhatsApp | Open QR pairing modal |
-| `/whatsapp status` | WhatsApp | Display connection & phone info |
+| `/whatsapp status` | WhatsApp | Display connection & user info |
 | `/whatsapp send <to> <msg>` | WhatsApp | Send WhatsApp message from CLI |
 | `/whatsapp mode <mode>` | WhatsApp | Set incoming relay (`notify`, `auto`, `off`) |
-| `/whatsapp logout` | WhatsApp | Disconnect and clear auth credentials |
+| `/whatsapp disconnect` | WhatsApp | Disconnect active WebSocket connection |
+| `/whatsapp clear` | WhatsApp | Disconnect and clear auth credentials |
 
 ### Keyboard Shortcuts
 | Shortcut | Action |

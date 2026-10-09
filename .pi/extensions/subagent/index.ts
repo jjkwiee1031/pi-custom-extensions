@@ -2,65 +2,342 @@
  * Subagent Extension for Pi
  *
  * Delegates sub-tasks to specialist agents running in isolated child `pi` processes.
- * Each subagent gets its own context window and session file.
+ * Integrates with plan-mode todo list execution and persists subagent sessions.
  *
- * Modules:
- * - utils.ts: Data models, agent discovery, session files, plan extraction
- * - process.ts: Isolated child process spawning and stdout JSON stream processing
- * - workflow.ts: Sequential multi-agent pipeline engine
- * - components.ts: Interactive TUI list component
+ * Architecture:
+ * - index.ts: Core extension module, child process runner, workflow engine, and lifecycle hooks.
+ * - components.ts: Interactive TUI list component for viewing delegations.
  */
 
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { SubagentListComponent } from "./components.ts";
-import { getAvailableRolesDescription, spawnChildProcess } from "./process.ts";
-import {
-	cleanTaskText,
-	extractPlanModeInfo,
-	findDelegation,
-	formatDelegationList,
-	getActiveDelegations,
-	getAgents,
-	getNextSubagentId,
-	makeSessionFile,
-	type AgentTemplate,
-	type SubagentDelegation,
-	type SubagentState,
-	type WorkflowConfig,
-} from "./utils.ts";
-import { executeWorkflow, loadWorkflowFile } from "./workflow.ts";
 
-// Tool Parameter Schemas
-const SubagentActionSchema = Type.Union([
-	Type.Literal("start"),
-	Type.Literal("done"),
-	Type.Literal("list"),
-	Type.Literal("delegate"),
-]);
+export type SubagentStatus = "in_progress" | "completed";
 
+export interface AgentTemplate {
+	name: string;
+	desc: string;
+	body: string;
+}
+
+export interface SubagentDelegation {
+	id: number;
+	task: string;
+	instructions?: string;
+	role?: string;
+	step?: number;
+	status: SubagentStatus;
+	sessionFile?: string;
+	createdAt: number;
+	completedAt?: number;
+}
+
+export interface SubagentState {
+	delegations: SubagentDelegation[];
+}
+
+export interface PlanStepInfo {
+	step: number;
+	text: string;
+	status?: "pending" | "in_progress" | "completed";
+	completed?: boolean;
+}
+
+export interface PlanModeInfo {
+	enabled: boolean;
+	executing?: boolean;
+	todos: PlanStepInfo[];
+	activeStep?: PlanStepInfo;
+}
+
+export interface WorkflowConfig {
+	agents: string[];
+	workflowCurrentIndex: number;
+	context?: string;
+}
+
+/**
+ * Normalizes and cleans task description text.
+ */
+export function cleanTaskText(text: string): string {
+	let cleaned = text
+		.replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/\s+/g, " ")
+		.trim();
+
+	if (cleaned.length > 0) {
+		cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+	}
+	return cleaned;
+}
+
+/**
+ * Calculates the next available subagent ID.
+ */
+export function getNextSubagentId(delegations: SubagentDelegation[]): number {
+	if (delegations.length === 0) return 1;
+	return Math.max(...delegations.map((d) => d.id)) + 1;
+}
+
+/**
+ * Formats a list of delegations for terminal display.
+ */
+export function formatDelegationList(delegations: SubagentDelegation[]): string {
+	if (delegations.length === 0) {
+		return "No sub-agent delegations in this session.";
+	}
+
+	return delegations
+		.map((d) => {
+			const statusMarker = d.status === "completed" ? "[COMPLETED]" : "[IN PROGRESS]";
+			const roleMarker = d.role ? ` (Role: ${d.role})` : "";
+			const stepMarker = d.step !== undefined ? ` (Linked to Plan Step #${d.step})` : "";
+			const instructions = d.instructions ? `\n    Instructions: ${d.instructions}` : "";
+			const sessionFile = d.sessionFile ? `\n    Session: ${d.sessionFile}` : "";
+			return `#${d.id} ${statusMarker}: ${d.task}${roleMarker}${stepMarker}${instructions}${sessionFile}`;
+		})
+		.join("\n");
+}
+
+/**
+ * Extracts active plan-mode info from session entries.
+ */
+export function extractPlanModeInfo(
+	entries: Array<{ type: string; customType?: string; data?: any }>,
+): PlanModeInfo | undefined {
+	const planEntry = [...entries]
+		.reverse()
+		.find((e) => e.type === "custom" && e.customType === "plan-mode");
+
+	if (!planEntry || !planEntry.data) {
+		return undefined;
+	}
+
+	const data = planEntry.data;
+	const todos: PlanStepInfo[] = Array.isArray(data.todos) ? data.todos : [];
+	const activeStep =
+		todos.find((t) => t.status === "in_progress") ??
+		todos.find((t) => !t.completed);
+
+	return {
+		enabled: Boolean(data.enabled),
+		executing: Boolean(data.executing),
+		todos,
+		activeStep,
+	};
+}
+
+/**
+ * Discovers specialist agent markdown definitions from `.pi/agents/*.md`.
+ */
+export function getAgents(baseDir: string = process.cwd()): AgentTemplate[] {
+	const dir = path.join(baseDir, ".pi", "agents");
+	try {
+		if (!fs.existsSync(dir)) return [];
+		const files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
+		const results: AgentTemplate[] = [];
+
+		for (const f of files) {
+			const raw = fs.readFileSync(path.join(dir, f), "utf8");
+			const match = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+			if (match) {
+				const front = match[1];
+				const nameMatch = front.match(/name:\s*(.+)/);
+				const descMatch = front.match(/description:\s*(.+)/);
+				if (nameMatch) {
+					results.push({
+						name: nameMatch[1].trim(),
+						desc: descMatch ? descMatch[1].trim() : "",
+						body: match[2].trim(),
+					});
+				}
+			}
+		}
+		return results;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Formats specialist roles for prompts and notifications.
+ */
+export function getAvailableRolesDescription(agentTemplates: AgentTemplate[]): string {
+	if (agentTemplates.length === 0) return "No specialist agents found.";
+	return agentTemplates.map((a) => `- ${a.name}: ${a.desc}`).join("\n");
+}
+
+/**
+ * Generates an isolated session file path for child subagents.
+ */
+export function makeSessionFile(sessionFile: string, id: string | number): string {
+	try {
+		const sessionDir = path.dirname(sessionFile);
+		const sessionName = path.basename(sessionFile, path.extname(sessionFile));
+		const subagentDir = path.join(sessionDir, sessionName);
+		fs.mkdirSync(subagentDir, { recursive: true });
+		return path.join(subagentDir, `subagent-${id}-${Date.now()}.jsonl`);
+	} catch {
+		const tmpDir = path.join(process.cwd(), ".pi", "subagents");
+		fs.mkdirSync(tmpDir, { recursive: true });
+		return path.join(tmpDir, `subagent-${id}-${Date.now()}.jsonl`);
+	}
+}
+
+/**
+ * Loads a multi-agent workflow definition from a JSON file.
+ */
+export function loadWorkflowFile(filePath: string): WorkflowConfig {
+	const resolved = path.resolve(filePath);
+	const raw = fs.readFileSync(resolved, "utf8");
+	const data = JSON.parse(raw);
+	return {
+		agents: Array.isArray(data.agents) ? data.agents : [],
+		workflowCurrentIndex: 0,
+		context: undefined,
+	};
+}
+
+/**
+ * Spawns an isolated child `pi` process with cancellation support and stderr capture.
+ */
+export function spawnChildProcess(
+	delegation: SubagentDelegation,
+	agentTemplates: AgentTemplate[],
+	signal?: AbortSignal,
+	spawnFn: typeof spawn = spawn,
+): Promise<string> {
+	const agent = delegation.role
+		? agentTemplates.find((a) => a.name.toLowerCase() === delegation.role?.toLowerCase())
+		: undefined;
+
+	const systemPrompt = agent?.body ?? "You are a specialist agent. Complete the delegated task thoroughly.";
+	const sessionFile = delegation.sessionFile ?? "";
+
+	const childArgs = [
+		"--mode", "json",
+		"--system-prompt", systemPrompt,
+		...(sessionFile ? ["--session", sessionFile] : []),
+		"--tools", "read,bash,edit,write,grep,find,ls",
+		"-p",
+		delegation.instructions
+			? `${delegation.task}\n\nAdditional instructions: ${delegation.instructions}`
+			: delegation.task,
+	];
+
+	return new Promise((resolve, reject) => {
+		const child = spawnFn("pi", childArgs, {
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env },
+		});
+
+		let buffer = "";
+		let result = "";
+		let stderrBuffer = "";
+
+		const abortListener = () => {
+			child.kill("SIGTERM");
+			reject(new Error("Subagent execution cancelled."));
+		};
+
+		if (signal) {
+			if (signal.aborted) {
+				child.kill("SIGTERM");
+				return reject(new Error("Subagent execution cancelled."));
+			}
+			signal.addEventListener("abort", abortListener, { once: true });
+		}
+
+		if (typeof child.stdout?.setEncoding === "function") {
+			child.stdout.setEncoding("utf8");
+		}
+		child.stdout?.on("data", (chunk: string | Buffer) => {
+			buffer += chunk.toString();
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				try {
+					const event = JSON.parse(line);
+					if (
+						event.type === "message_update" &&
+						event.assistantMessageEvent?.type === "text_delta"
+					) {
+						result += event.assistantMessageEvent.delta;
+					}
+				} catch {
+					// Ignore non-JSON lines
+				}
+			}
+		});
+
+		if (typeof child.stderr?.setEncoding === "function") {
+			child.stderr.setEncoding("utf8");
+		}
+		child.stderr?.on("data", (chunk: string | Buffer) => {
+			stderrBuffer += chunk.toString();
+		});
+
+		child.on("close", (code) => {
+			if (signal) {
+				signal.removeEventListener("abort", abortListener);
+			}
+
+			if (code !== 0 && !result.trim()) {
+				const errMsg = stderrBuffer.trim()
+					? `Child process exited with code ${code}: ${stderrBuffer.trim()}`
+					: `Child process exited with code ${code ?? 0}.`;
+				resolve(errMsg);
+				return;
+			}
+
+			resolve(result.trim() || `Child process completed (exit code ${code ?? 0}).`);
+		});
+
+		child.on("error", (err) => {
+			if (signal) {
+				signal.removeEventListener("abort", abortListener);
+			}
+			reject(err);
+		});
+	});
+}
+
+// Tool schema: simplified direct invocation without action verbs
 const SubagentParamsSchema = Type.Object({
-	action: SubagentActionSchema,
-	subagentId: Type.Optional(Type.Number({ description: "Sub-agent ID (number)" })),
-	step: Type.Optional(Type.Number({ description: "Plan-mode step number to link (optional)" })),
+	task: Type.String({ description: "Sub-agent task description" }),
 	role: Type.Optional(
 		Type.String({
-			description: "Specialist agent role (e.g. 'planner', 'worker'). Discovered from .pi/agents/*.md",
+			description: "Specialist agent role (e.g. 'planner', 'worker') discovered from .pi/agents/*.md",
 		}),
 	),
-	task: Type.Optional(Type.String({ description: "Sub-agent task description" })),
 	instructions: Type.Optional(Type.String({ description: "Extra instructions or guidance (optional)" })),
+	step: Type.Optional(Type.Number({ description: "Plan-mode todo step number to link and track" })),
 });
 
-export default function subagentExtension(pi: ExtensionAPI): void {
+export default function subagentExtension(
+	pi: ExtensionAPI,
+	options?: {
+		spawnProcess?: (
+			delegation: SubagentDelegation,
+			agentTemplates: AgentTemplate[],
+			signal?: AbortSignal,
+		) => Promise<string>;
+	},
+): void {
+	const runProcess = options?.spawnProcess ?? spawnChildProcess;
 	let delegations: SubagentDelegation[] = [];
 	let agentTemplates: AgentTemplate[] = [];
 	let parentPath = "";
 
-	// Multi-agent workflow configuration
 	const currentWorkflow: WorkflowConfig = {
 		agents: [],
 		workflowCurrentIndex: 0,
@@ -72,9 +349,8 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		const active = getActiveDelegations(delegations);
+		const active = delegations.filter((d) => d.status === "in_progress");
 
-		// Status bar indicator
 		if (active.length > 0) {
 			const primary = active[0];
 			const rolePart = primary.role ? ` (${primary.role})` : "";
@@ -86,12 +362,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					`🤖 #${primary.id}${rolePart}: ${primary.task.slice(0, 25)}${countNotice}`,
 				),
 			);
-		} else {
-			ctx.ui.setStatus("subagent", undefined);
-		}
 
-		// Widget showing active delegations above the editor
-		if (active.length > 0) {
 			const widgetLines = active.map((d) => {
 				const roleText = d.role ? ` [${d.role}]` : "";
 				const stepText = d.step !== undefined ? ` (Plan #${d.step})` : "";
@@ -99,6 +370,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			});
 			ctx.ui.setWidget("subagent-delegations", widgetLines);
 		} else {
+			ctx.ui.setStatus("subagent", undefined);
 			ctx.ui.setWidget("subagent-delegations", undefined);
 		}
 	}
@@ -117,228 +389,86 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	// Register the `subagent` tool for LLM delegation
+	// Register streamlined `subagent` tool
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: `Delegate sub-tasks to specialist agents running in isolated child processes.
-Each subagent gets its own context window and session file.
-
-Actions:
-- start: Spawn a child pi process for a task. Optionally specify a specialist role and link to a plan step.
-- done: Mark a delegation as completed (and mark the linked plan step done).
-- list: List all delegations.
-- delegate: Auto-link to the current active plan-mode step.
+Each subagent executes in its own context window and session file.
 
 Available specialist roles:
 ${getAvailableRolesDescription(agentTemplates)}`,
 		parameters: SubagentParamsSchema,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			switch (params.action) {
-				case "start": {
-					if (!params.task) {
-						return {
-							content: [{ type: "text", text: "Error: task description is required for action 'start'." }],
-						};
-					}
-
-					const id = params.subagentId ?? getNextSubagentId(delegations);
-					const task = cleanTaskText(params.task);
-					const role = params.role;
-					const parentSession = ctx.sessionManager.getSessionFile();
-					const sessionFile = makeSessionFile(parentSession, id);
-
-					if (params.step !== undefined) {
-						await updatePlanStepStatus(params.step, "start", ctx);
-					}
-
-					const delegation: SubagentDelegation = {
-						id,
-						task,
-						instructions: params.instructions,
-						role,
-						step: params.step,
-						status: "in_progress",
-						sessionFile,
-						createdAt: Date.now(),
-					};
-
-					const existingIdx = delegations.findIndex((d) => d.id === id);
-					if (existingIdx >= 0) {
-						delegations[existingIdx] = delegation;
-					} else {
-						delegations.push(delegation);
-					}
-
-					updateStatus(ctx);
-					persistState();
-
-					ctx.ui.notify(`🤖 Spawning subagent #${id}${role ? ` (${role})` : ""}...`, "info");
-
-					let childResult: string;
-					try {
-						childResult = await spawnChildProcess(ctx, delegation, agentTemplates);
-					} catch (err) {
-						childResult = `Error: Child process failed: ${err}`;
-					}
-
-					delegation.status = "completed";
-					delegation.completedAt = Date.now();
-
-					if (params.step !== undefined) {
-						await updatePlanStepStatus(params.step, "done", ctx);
-					}
-
-					updateStatus(ctx);
-					persistState();
-
-					const roleLabel = role ? ` (${role})` : "";
-					const stepLabel = params.step !== undefined ? ` Plan step #${params.step} marked completed ✓.` : "";
-
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Subagent #${id}${roleLabel} completed task: "${task}" ✓.${stepLabel}\n\nSubagent Response:\n${childResult}`,
-							},
-						],
-					};
-				}
-
-				case "done": {
-					const target = findDelegation(delegations, params.subagentId);
-					if (!target) {
-						const idDesc = params.subagentId !== undefined ? `#${params.subagentId}` : "(no active delegation)";
-						return {
-							content: [{ type: "text", text: `Error: Subagent delegation ${idDesc} not found.` }],
-						};
-					}
-
-					target.status = "completed";
-					target.completedAt = Date.now();
-
-					const linkedStep = params.step ?? target.step;
-					if (linkedStep !== undefined) {
-						await updatePlanStepStatus(linkedStep, "done", ctx);
-					}
-
-					updateStatus(ctx);
-					persistState();
-
-					const linkNotice = linkedStep !== undefined ? ` Linked plan step #${linkedStep} marked completed ✓.` : "";
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Subagent #${target.id} completed task: "${target.task}" ✓.${linkNotice}`,
-							},
-						],
-					};
-				}
-
-				case "list": {
-					const rolesList = getAvailableRolesDescription(agentTemplates);
-					const formatted = formatDelegationList(delegations);
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Available Specialist Roles:\n${rolesList}\n\nSubagent Delegations:\n\n${formatted}`,
-							},
-						],
-					};
-				}
-
-				case "delegate": {
-					const entries = ctx.sessionManager.getEntries();
-					const planInfo = extractPlanModeInfo(entries);
-					const activeStep = planInfo?.activeStep;
-
-					const step = params.step ?? activeStep?.step;
-					const fallbackTask = activeStep ? activeStep.text : "Delegated sub-task";
-					const task = cleanTaskText(params.task ?? fallbackTask);
-					const role = params.role ?? "worker";
-					const id = params.subagentId ?? getNextSubagentId(delegations);
-					const parentSession = ctx.sessionManager.getSessionFile();
-					const sessionFile = makeSessionFile(parentSession, id);
-
-					if (!activeStep && !params.task) {
-						return {
-							content: [{
-							type: "text",
-							text: "Error: No active plan steps found to delegate. Initialize a plan first with /plan, or specify a task explicitly with subagent(action: 'delegate', task: '...')."
-							}]
-						};
-					}
-
-					if (step !== undefined) {
-						await updatePlanStepStatus(step, "start", ctx);
-					}
-
-					const delegation: SubagentDelegation = {
-						id,
-						task,
-						instructions: params.instructions,
-						role,
-						step,
-						status: "in_progress",
-						sessionFile,
-						createdAt: Date.now(),
-					};
-
-					delegations.push(delegation);
-					updateStatus(ctx);
-					persistState();
-
-					ctx.ui.notify(`🤖 Spawning subagent #${id} (${role}) for plan step #${step ?? "?"}...`, "info");
-
-					let childResult: string;
-					try {
-						childResult = await spawnChildProcess(ctx, delegation, agentTemplates);
-					} catch (err) {
-						childResult = `Error: Child process failed: ${err}`;
-					}
-
-					delegation.status = "completed";
-					delegation.completedAt = Date.now();
-
-					if (step !== undefined) {
-						await updatePlanStepStatus(step, "done", ctx);
-					}
-
-					updateStatus(ctx);
-					persistState();
-
-					const stepLabel = step !== undefined ? ` Plan step #${step} marked completed ✓.` : "";
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Subagent #${id} (${role}) completed delegated task: "${task}" ✓.${stepLabel}\n\nSubagent Response:\n${childResult}`,
-							},
-						],
-					};
-				}
-
-				default:
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Unknown action: ${(params as { action: string }).action}`,
-							},
-						],
-					};
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const task = cleanTaskText(params.task);
+			if (!task) {
+				return {
+					content: [{ type: "text", text: "Error: Task description cannot be empty." }],
+				};
 			}
+
+			const id = getNextSubagentId(delegations);
+			const role = params.role;
+			const parentSession = ctx.sessionManager.getSessionFile();
+			const sessionFile = makeSessionFile(parentSession, id);
+
+			if (params.step !== undefined) {
+				await updatePlanStepStatus(params.step, "start", ctx);
+			}
+
+			const delegation: SubagentDelegation = {
+				id,
+				task,
+				instructions: params.instructions,
+				role,
+				step: params.step,
+				status: "in_progress",
+				sessionFile,
+				createdAt: Date.now(),
+			};
+
+			delegations.push(delegation);
+			updateStatus(ctx);
+			persistState();
+
+			ctx.ui.notify(`🤖 Spawning subagent #${id}${role ? ` (${role})` : ""}...`, "info");
+
+			let childResult: string;
+			try {
+				childResult = await runProcess(delegation, agentTemplates, signal);
+			} catch (err: any) {
+				childResult = `Error: Child process failed: ${err.message || err}`;
+			}
+
+			delegation.status = "completed";
+			delegation.completedAt = Date.now();
+
+			if (params.step !== undefined) {
+				await updatePlanStepStatus(params.step, "done", ctx);
+			}
+
+			updateStatus(ctx);
+			persistState();
+
+			const roleLabel = role ? ` (${role})` : "";
+			const stepLabel = params.step !== undefined ? ` Plan step #${params.step} marked completed ✓.` : "";
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Subagent #${id}${roleLabel} completed: "${task}" ✓.${stepLabel}\n\nSubagent Response:\n${childResult}`,
+					},
+				],
+			};
 		},
 
 		renderCall(args, theme, _context) {
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("muted", args.action);
-			if (args.subagentId !== undefined) text += ` ${theme.fg("accent", `#${args.subagentId}`)}`;
-			if (args.role) text += ` ${theme.fg("dim", `[${args.role}]`)}`;
-			if (args.step !== undefined) text += ` ${theme.fg("dim", `(step #${args.step})`)}`;
-			if (args.task) text += ` ${theme.fg("dim", `"${args.task}"`)}`;
+			let text = theme.fg("toolTitle", theme.bold("subagent "));
+			if (args.role) text += `${theme.fg("accent", `[${args.role}] `)}`;
+			if (args.step !== undefined) text += `${theme.fg("dim", `(plan #${args.step}) `)}`;
+			if (args.task) text += `${theme.fg("muted", `"${args.task}"`)}`;
 			return new Text(text, 0, 0);
 		},
 
@@ -351,7 +481,7 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 
 	// Register /subagent command
 	pi.registerCommand("subagent", {
-		description: "Start or manage sub-agent delegations (usage: /subagent [<task>|list|clear|roles])",
+		description: "Start or manage sub-agent delegations (/subagent [<task>|list|clear|roles])",
 		handler: async (args, ctx) => {
 			const raw = args?.trim() ?? "";
 
@@ -407,6 +537,7 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 				}
 			}
 
+			// In interactive command, auto-link active plan step if available
 			const entries = ctx.sessionManager.getEntries();
 			const planInfo = extractPlanModeInfo(entries);
 			const step = planInfo?.activeStep?.step;
@@ -438,9 +569,9 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 
 			let childResult: string;
 			try {
-				childResult = await spawnChildProcess(ctx, delegation, agentTemplates);
-			} catch (err) {
-				childResult = `Error: ${err}`;
+				childResult = await runProcess(delegation, agentTemplates);
+			} catch (err: any) {
+				childResult = `Error: ${err.message || err}`;
 			}
 
 			delegation.status = "completed";
@@ -467,7 +598,7 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 		},
 	});
 
-	// Register /sub-switch command — switch into a subagent's session
+	// Register /sub-switch command — switch into a subagent's session transcript
 	pi.registerCommand("sub-switch", {
 		description: "Switch to a sub-agent's session (usage: /sub-switch <agent-name or #id>)",
 		handler: async (args, ctx) => {
@@ -482,7 +613,7 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 				const id = Number(query.slice(1));
 				target = delegations.find((d) => d.id === id);
 			} else {
-				target = [...delegations].reverse().find((d) => d.role === query);
+				target = [...delegations].reverse().find((d) => d.role?.toLowerCase() === query.toLowerCase());
 			}
 
 			if (!target) {
@@ -535,29 +666,81 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 					currentWorkflow.workflowCurrentIndex = 0;
 					currentWorkflow.context = undefined;
 					ctx.ui.notify(`Loaded workflow with ${currentWorkflow.agents.length} agent(s).`, "info");
-				} catch (err) {
-					ctx.ui.notify(`Failed to load workflow: ${err}`, "error");
+				} catch (err: any) {
+					ctx.ui.notify(`Failed to load workflow: ${err.message || err}`, "error");
 				}
 				return;
 			}
 
 			if (subCmd === "run") {
-				try {
-					await executeWorkflow({
-						pi,
-						ctx,
-						task: rest || "Execute the workflow",
-						workflow: currentWorkflow,
-						delegations,
-						agentTemplates,
-						onUpdate: () => {
-							updateStatus(ctx);
-							persistState();
-						},
-					});
-				} catch (err: any) {
-					ctx.ui.notify(`Workflow error: ${err.message}`, "error");
+				if (currentWorkflow.agents.length === 0) {
+					ctx.ui.notify("No workflow loaded. Load a workflow definition first.", "error");
+					return;
 				}
+
+				const task = rest || "Execute the workflow";
+				currentWorkflow.workflowCurrentIndex = 0;
+				currentWorkflow.context = "";
+
+				for (let i = 0; i < currentWorkflow.agents.length; i++) {
+					const agentRole = currentWorkflow.agents[i];
+					currentWorkflow.workflowCurrentIndex = i;
+
+					ctx.ui.notify(
+						`🤖 Workflow step ${i + 1}/${currentWorkflow.agents.length}: Running ${agentRole}...`,
+						"info",
+					);
+
+					const id = getNextSubagentId(delegations);
+					const parentSession = ctx.sessionManager.getSessionFile();
+					const sessionFile = makeSessionFile(parentSession, id);
+					const fullTask = currentWorkflow.context
+						? `Previous agent output:\n${currentWorkflow.context}\n\nTask:\n${task}`
+						: task;
+
+					const delegation: SubagentDelegation = {
+						id,
+						task: `Workflow step ${i + 1}: ${agentRole} — ${task}`,
+						role: agentRole,
+						status: "in_progress",
+						sessionFile,
+						createdAt: Date.now(),
+					};
+
+					delegations.push(delegation);
+					updateStatus(ctx);
+					persistState();
+
+					let childResult: string;
+					try {
+						childResult = await runProcess(delegation, agentTemplates);
+					} catch (err: any) {
+						childResult = `Error: ${err.message || err}`;
+						ctx.ui.notify(`Workflow failed at step ${i + 1} (${agentRole}): ${childResult}`, "error");
+						delegation.status = "completed";
+						delegation.completedAt = Date.now();
+						updateStatus(ctx);
+						persistState();
+						break;
+					}
+
+					delegation.status = "completed";
+					delegation.completedAt = Date.now();
+					currentWorkflow.context = childResult;
+					updateStatus(ctx);
+					persistState();
+				}
+
+				pi.sendMessage(
+					{
+						customType: "workflow-result",
+						content: `Workflow complete (${currentWorkflow.agents.length} agents).\n\nFinal result:\n${currentWorkflow.context}`,
+						display: true,
+					},
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
+
+				ctx.ui.notify("🤖 Workflow complete!", "info");
 				return;
 			}
 
@@ -566,7 +749,8 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 	});
 
 	// Register keyboard shortcut Ctrl+Alt+S
-	pi.registerShortcut(Key.ctrlAlt("s"), {
+	const shortcutKey = typeof (Key as any)?.ctrlAlt === "function" ? (Key as any).ctrlAlt("s") : "ctrl+alt+s";
+	pi.registerShortcut(shortcutKey, {
 		description: "Start a sub-agent turn",
 		handler: async (ctx) => {
 			if (!ctx.hasUI) return;
@@ -607,9 +791,9 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 
 			let childResult: string;
 			try {
-				childResult = await spawnChildProcess(ctx, delegation, agentTemplates);
-			} catch (err) {
-				childResult = `Error: ${err}`;
+				childResult = await runProcess(delegation, agentTemplates);
+			} catch (err: any) {
+				childResult = `Error: ${err.message || err}`;
 			}
 
 			delegation.status = "completed";
@@ -653,7 +837,7 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 
 	// Lifecycle: Inject guidance before agent turn starts if subagents are in progress
 	pi.on("before_agent_start", async () => {
-		const active = getActiveDelegations(delegations);
+		const active = delegations.filter((d) => d.status === "in_progress");
 		if (active.length === 0) return;
 
 		const activeSummary = active
@@ -672,8 +856,7 @@ ${activeSummary}
 Available specialist roles:
 ${getAvailableRolesDescription(agentTemplates)}
 
-Use subagent(action: "start", role: "<role>", task: "<task>") to delegate work to isolated child processes.
-Use subagent(action: "done", subagentId: <id>) to mark completed manually if needed.`,
+Use subagent(task: "<task>", role?: "<role>", step?: <step>) to delegate work to isolated child processes.`,
 				display: false,
 			},
 		};
@@ -681,7 +864,7 @@ Use subagent(action: "done", subagentId: <id>) to mark completed manually if nee
 
 	// Lifecycle: Clean out stale subagent context messages
 	pi.on("context", async (event) => {
-		const active = getActiveDelegations(delegations);
+		const active = delegations.filter((d) => d.status === "in_progress");
 		if (active.length > 0) return;
 
 		return {
