@@ -323,6 +323,9 @@ const SubagentParamsSchema = Type.Object({
 	step: Type.Optional(Type.Number({ description: "Plan-mode todo step number to link and track" })),
 });
 
+// Module-level parent session path (persists across subagent session switching)
+let parentPath = "";
+
 export default function subagentExtension(
 	pi: ExtensionAPI,
 	options?: {
@@ -336,7 +339,6 @@ export default function subagentExtension(
 	const runProcess = options?.spawnProcess ?? spawnChildProcess;
 	let delegations: SubagentDelegation[] = [];
 	let agentTemplates: AgentTemplate[] = [];
-	let parentPath = "";
 
 	const currentWorkflow: WorkflowConfig = {
 		agents: [],

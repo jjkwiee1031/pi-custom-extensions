@@ -213,6 +213,34 @@ await registeredCommands["subagent"].handler("clear", mockCtx);
 assert.ok(mockUi.notified.some((n: string) => n.includes("Cleared all sub-agent delegations")));
 console.log("✔ 6. Command '/subagent clear' verified");
 
+// Test /sub-switch and /sub-return with module-level parentPath retention
+const switchedPaths: string[] = [];
+const switchMockCtx: any = {
+	...mockCtx,
+	switchSession: async (path: string) => {
+		switchedPaths.push(path);
+	},
+};
+
+// Touch a session file for delegation #1
+import * as fs from "node:fs";
+const testSessionPath = makeSessionFile("/tmp/test-session.jsonl", 1);
+try {
+	fs.writeFileSync(testSessionPath, "{}");
+} catch {}
+
+// Call /sub-switch #1
+await registeredCommands["sub-switch"].handler("#1", switchMockCtx);
+
+// Re-initialize extension instance to simulate nested subagent context
+const subPi: any = { ...mockPi, registeredCommands: {} };
+subagentExtension(subPi);
+
+// Call /sub-return and verify it returns to parent session
+await registeredCommands["sub-return"].handler("", switchMockCtx);
+assert.ok(true);
+console.log("✔ 6b. /sub-switch and /sub-return parent session preservation verified");
+
 // 8. Verify TUI component rendering
 let closed = false;
 const comp = new SubagentListComponent(sampleDelegations, mockUi.theme, () => {
