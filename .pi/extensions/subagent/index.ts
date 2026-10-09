@@ -178,16 +178,17 @@ export function getAvailableRolesDescription(agentTemplates: AgentTemplate[]): s
  * Generates an isolated session file path for child subagents.
  */
 export function makeSessionFile(sessionFile: string, id: string | number): string {
+	const suffix = Math.random().toString(36).slice(2, 8);
 	try {
 		const sessionDir = path.dirname(sessionFile);
 		const sessionName = path.basename(sessionFile, path.extname(sessionFile));
 		const subagentDir = path.join(sessionDir, sessionName);
 		fs.mkdirSync(subagentDir, { recursive: true });
-		return path.join(subagentDir, `subagent-${id}-${Date.now()}.jsonl`);
+		return path.join(subagentDir, `subagent-${id}-${Date.now()}-${suffix}.jsonl`);
 	} catch {
 		const tmpDir = path.join(process.cwd(), ".pi", "subagents");
 		fs.mkdirSync(tmpDir, { recursive: true });
-		return path.join(tmpDir, `subagent-${id}-${Date.now()}.jsonl`);
+		return path.join(tmpDir, `subagent-${id}-${Date.now()}-${suffix}.jsonl`);
 	}
 }
 
@@ -224,6 +225,7 @@ export function spawnChildProcess(
 	const childArgs = [
 		"--mode", "json",
 		"--system-prompt", systemPrompt,
+		"-ne",
 		...(sessionFile ? ["--session", sessionFile] : []),
 		"--tools", "read,bash,edit,write,grep,find,ls",
 		"-p",
@@ -415,10 +417,6 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 			const parentSession = ctx.sessionManager.getSessionFile();
 			const sessionFile = makeSessionFile(parentSession, id);
 
-			if (params.step !== undefined) {
-				await updatePlanStepStatus(params.step, "start", ctx);
-			}
-
 			const delegation: SubagentDelegation = {
 				id,
 				task,
@@ -430,15 +428,13 @@ ${getAvailableRolesDescription(agentTemplates)}`,
 				createdAt: Date.now(),
 			};
 
-			// Upsert (update or insert) delegation to prevent duplicate IDs
-			const existingIdx = delegations.findIndex((d) => d.id === id);
-			if (existingIdx >= 0) {
-				delegations[existingIdx] = delegation;
-			} else {
-				delegations.push(delegation);
-			}
+			delegations.push(delegation);
 			updateStatus(ctx);
 			persistState();
+
+			if (params.step !== undefined) {
+				await updatePlanStepStatus(params.step, "start", ctx);
+			}
 
 			ctx.ui.notify(`🤖 Spawning subagent #${id}${role ? ` (${role})` : ""}...`, "info");
 

@@ -281,6 +281,23 @@ assert.ok(contextInject.message.content.includes("ACTIVE SUBAGENT DELEGATIONS"))
 assert.ok(contextInject.message.content.includes("Task 2"));
 console.log("✔ 8. Lifecycle persistence and prompt injection verified");
 
+// 10. Concurrent subagent executions test (prevent race condition and EEXIST / ID duplication)
+const concurrentPromises = [
+	subagentTool.execute("tc-c1", { task: "Write paragraph 1", step: 1 }, undefined, undefined, mockCtx),
+	subagentTool.execute("tc-c2", { task: "Write paragraph 2", step: 2 }, undefined, undefined, mockCtx),
+	subagentTool.execute("tc-c3", { task: "Write paragraph 3", step: 3 }, undefined, undefined, mockCtx),
+	subagentTool.execute("tc-c4", { task: "Write paragraph 4", step: 4 }, undefined, undefined, mockCtx),
+	subagentTool.execute("tc-c5", { task: "Write paragraph 5", step: 5 }, undefined, undefined, mockCtx),
+];
+const concurrentResults = await Promise.all(concurrentPromises);
+const extractedIds = concurrentResults.map((r: any) => {
+	const match = r.content[0].text.match(/Subagent #(\d+)/);
+	return match ? Number(match[1]) : 0;
+});
+const uniqueIds = new Set(extractedIds);
+assert.strictEqual(uniqueIds.size, 5, "All 5 concurrent subagents must have unique IDs");
+console.log("✔ 9. Concurrent subagent execution and race-condition prevention verified");
+
 console.log("\n============================================");
 console.log("All Subagent Extension tests passed successfully! 🎉");
 console.log("============================================");
